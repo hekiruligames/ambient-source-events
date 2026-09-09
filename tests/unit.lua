@@ -90,7 +90,7 @@ local function test()
         local settings = obs.obs_data_create()
         source.get_defaults(settings)
         for k, v in pairs(options or {}) do
-            if k:find('effect') or k:find('mode') or k:find('direction')
+            if k:find('effect') or k:find('mode') or k:find('direction') or k:find('easing')
                     or k:find('angle') or k:find('anchor') or k == 'first_display' then
                 obs.obs_data_set_int(settings, k, v)
             else obs.obs_data_set_double(settings, k, v) end
@@ -319,6 +319,110 @@ local function test()
     destroy(d, p, f)
     check(matrix_depth == 0, 'Zoom rendering restores the graphics matrix stack')
 
+    local curves = {
+        {name = 'Linear', value = 0, samples = {0.25, 0.5, 0.75}},
+        {name = 'Ease In', value = 1, samples = {0.015625, 0.125, 0.421875}},
+        {name = 'Ease Out', value = 2, samples = {0.578125, 0.875, 0.984375}},
+        {name = 'Ease In/Out', value = 3, samples = {0.0625, 0.5, 0.9375}},
+    }
+    for _, curve in ipairs(curves) do
+        d, p, f = make({display_duration = 3, start_effect = 1, start_duration = 1,
+            start_easing = curve.value, end_effect = 0}, false)
+        check(d.start_progress == 0 and d.alpha == 0,
+            curve.name .. ' preserves the zero endpoint')
+        for step = 1, 100 do
+            tick(d, p, 0.01)
+            check(d.start_progress >= 0 and d.start_progress <= 1,
+                curve.name .. ' remains in the unit interval ' .. step)
+            if step % 25 == 0 then
+                local index = step / 25
+                local expected = index == 4 and 1 or curve.samples[index]
+                check(near(d.start_progress, expected), curve.name .. ' sample ' .. index)
+            end
+        end
+        tick(d, p, 1)
+        check(d.start_progress == 1 and d.alpha == 1,
+            curve.name .. ' preserves the one endpoint')
+        destroy(d, p, f)
+    end
+
+    local function reset_rendered()
+        rendered_alpha, rendered_offset_x, rendered_offset_y = nil, nil, nil
+        rendered_wipe_x, rendered_wipe_y = nil, nil
+        rendered_wipe_progress, rendered_wipe_mode = nil, nil
+        rendered_zoom_visible = nil
+        rendered_translate_x, rendered_translate_y = nil, nil
+        rendered_scale_x, rendered_scale_y = nil, nil
+    end
+    local function check_effect_render(effect_value, progress, starting, label)
+        reset_rendered()
+        source.video_render(d)
+        if effect_value == 1 then
+            check(near(rendered_alpha, starting and progress or 1 - progress)
+                    and rendered_offset_x == 0 and rendered_offset_y == 0
+                    and rendered_wipe_mode == 0
+                    and rendered_scale_x == 1 and rendered_scale_y == 1,
+                label .. ' changes only Fade opacity')
+        elseif effect_value == 2 then
+            check(rendered_alpha == 1
+                    and near(rendered_offset_x, starting and -(1 - progress) or progress)
+                    and rendered_offset_y == 0 and rendered_wipe_mode == 0
+                    and rendered_scale_x == 1 and rendered_scale_y == 1,
+                label .. ' changes only Peek position')
+        elseif effect_value == 3 then
+            check(rendered_alpha == 1 and rendered_offset_x == 0 and rendered_offset_y == 0
+                    and near(rendered_wipe_progress, progress)
+                    and rendered_wipe_mode == (starting and 1 or 2)
+                    and rendered_scale_x == 1 and rendered_scale_y == 1,
+                label .. ' changes only Wipe boundary')
+        else
+            local expected_scale = starting and 0.5 + 0.5 * progress or 1 - 0.5 * progress
+            check(rendered_alpha == 1 and rendered_offset_x == 0 and rendered_offset_y == 0
+                    and rendered_wipe_mode == 0
+                    and near(rendered_scale_x, expected_scale)
+                    and near(rendered_scale_y, expected_scale),
+                label .. ' changes only Zoom scale')
+        end
+    end
+    local effect_names = {'Fade', 'Peek', 'Wipe', 'Zoom'}
+    for effect_value, effect_name in ipairs(effect_names) do
+        for _, curve in ipairs(curves) do
+            local expected = curve.samples[1]
+            d, p, f = make({display_duration = 3, start_effect = effect_value,
+                start_duration = 1, start_easing = curve.value, start_direction = 2,
+                start_zoom_percent = 50, start_zoom_anchor = 4, end_effect = 0}, false)
+            tick(d, p, 0.25)
+            check(near(d.start_progress, expected),
+                effect_name .. ' start applies ' .. curve.name)
+            check_effect_render(effect_value, expected, true,
+                effect_name .. ' start ' .. curve.name)
+            destroy(d, p, f)
+
+            d, p, f = make({display_duration = 2, start_effect = 0,
+                end_effect = effect_value, end_duration = 1, end_easing = curve.value,
+                end_direction = 2, end_zoom_percent = 50, end_zoom_anchor = 4}, false)
+            tick(d, p, 1.25)
+            check(near(d.end_progress, expected),
+                effect_name .. ' end applies ' .. curve.name)
+            check_effect_render(effect_value, expected, false,
+                effect_name .. ' end ' .. curve.name)
+            destroy(d, p, f)
+        end
+    end
+
+    d, p, f = make({display_duration = 2, start_effect = 1, start_easing = 1,
+        end_effect = 1, end_easing = 2}, false)
+    check(d.cfg.start_easing == 1 and d.cfg.end_easing == 2,
+        'Start and end easing settings are independent')
+    local legacy_settings = obs.obs_data_create()
+    obs.obs_data_set_int(legacy_settings, 'start_effect', 1)
+    obs.obs_data_set_int(legacy_settings, 'end_effect', 4)
+    source.update(d, legacy_settings)
+    check(d.pending_cfg.start_easing == 0 and d.pending_cfg.end_easing == 0,
+        'Stored settings without easing values use Linear')
+    obs.obs_data_release(legacy_settings)
+    destroy(d, p, f)
+
     d, p, f = make({first_display = 1, interval = -1, random_min = -2, random_max = -3,
         display_duration = -1, start_duration = -1, end_duration = -1}, false)
     check(d.cfg.interval == 0 and d.cfg.lo == 0 and d.cfg.hi == 0, 'Negative stored waits normalize to zero')
@@ -412,12 +516,37 @@ local function test()
     check(obs.obs_property_visible(obs.obs_properties_get(props, 'random_min')), 'Random field shown')
     check(not obs.obs_property_visible(obs.obs_properties_get(props, 'start_direction')),
         'Peek direction hidden for Fade')
+    local easing_items = {
+        '一定', 'ゆっくり始まる', 'ゆっくり終わる',
+        'ゆっくり始まり、ゆっくり終わる',
+    }
+    for _, prefix in ipairs({'start', 'end'}) do
+        local property = obs.obs_properties_get(props, prefix .. '_easing')
+        check(property ~= nil and obs.obs_property_list_item_count(property) == #easing_items,
+            prefix .. ' easing shows exactly four choices')
+        for index, name in ipairs(easing_items) do
+            check(obs.obs_property_list_item_name(property, index - 1) == name
+                    and obs.obs_property_list_item_int(property, index - 1) == index - 1,
+                prefix .. ' easing label and stored value ' .. index)
+        end
+    end
+    check(obs.obs_data_get_int(settings, 'start_easing') == 0
+            and obs.obs_data_get_int(settings, 'end_easing') == 0,
+        'Start and end easing default to Linear')
+    obs.obs_data_set_int(settings, 'start_effect', 0)
+    obs.obs_data_set_int(settings, 'end_effect', 0)
+    check(obs.obs_property_modified(obs.obs_properties_get(props, 'start_effect'), settings)
+            and obs.obs_property_modified(obs.obs_properties_get(props, 'end_effect'), settings)
+            and not obs.obs_property_visible(obs.obs_properties_get(props, 'start_easing'))
+            and not obs.obs_property_visible(obs.obs_properties_get(props, 'end_easing')),
+        'No effect hides start and end easing controls')
     obs.obs_data_set_int(settings, 'start_effect', 2)
     check(obs.obs_property_modified(obs.obs_properties_get(props, 'start_effect'), settings),
         'Peek selection updates visibility')
-    check(obs.obs_property_visible(obs.obs_properties_get(props, 'start_direction'))
+    check(obs.obs_property_visible(obs.obs_properties_get(props, 'start_easing'))
+            and obs.obs_property_visible(obs.obs_properties_get(props, 'start_direction'))
             and not obs.obs_property_visible(obs.obs_properties_get(props, 'start_angle')),
-        'Peek shows direction but hides non-custom angle')
+        'Peek shows easing and direction but hides non-custom angle')
     obs.obs_data_set_int(settings, 'start_effect', 3)
     check(obs.obs_property_modified(obs.obs_properties_get(props, 'start_effect'), settings)
             and obs.obs_property_visible(obs.obs_properties_get(props, 'start_direction')),

@@ -1,4 +1,4 @@
--- Ambient Source Events 0.4.0 / OBS Studio 32.0.4
+-- Ambient Source Events 0.5.0 / OBS Studio 32.0.4
 -- Source timing belongs to video_tick; video_render never advances time.
 local obs = obslua
 local bit = require('bit')
@@ -6,6 +6,7 @@ local ID = 'lua_ambient_source_events_v1'
 local TITLE = 'ソース定期表示'
 local LIMIT, WATCHDOG, ZOOM_UI_MAX = 86400, 10, 1000000
 local NONE, FADE, PEEK, WIPE, ZOOM = 0, 1, 2, 3, 4
+local LINEAR, EASE_IN, EASE_OUT, EASE_IN_OUT = 0, 1, 2, 3
 local instances, owners, restore_jobs = {}, {}, {}
 local disconnect_jobs = {}
 local exiting, unloading = false, false
@@ -56,6 +57,24 @@ end
 local function effect(settings, key)
     return clamp(obs.obs_data_get_int(settings, key), NONE, ZOOM)
 end
+local function easing(settings, key)
+    return clamp(obs.obs_data_get_int(settings, key), LINEAR, EASE_IN_OUT)
+end
+local function eased_progress(t, mode)
+    t = clamp(t, 0, 1)
+    if t == 0 or t == 1 or mode == LINEAR then return t end
+    local value
+    if mode == EASE_IN then
+        value = t * t * t
+    elseif mode == EASE_OUT then
+        local remaining = 1 - t
+        value = 1 - remaining * remaining * remaining
+    else
+        value = t < 0.5 and 4 * t * t * t
+            or 1 - ((-2 * t + 2) ^ 3) / 2
+    end
+    return clamp(value, 0, 1)
+end
 local function direction(settings, key)
     return clamp(obs.obs_data_get_int(settings, key), 0, 8)
 end
@@ -83,6 +102,8 @@ local function config(settings)
         duration = number(settings, 'display_duration', 5, 0.01),
         include = obs.obs_data_get_int(settings, 'duration_mode') ~= 1,
         start_effect = start_effect, end_effect = end_effect,
+        start_easing = start_effect ~= NONE and easing(settings, 'start_easing') or LINEAR,
+        end_easing = end_effect ~= NONE and easing(settings, 'end_easing') or LINEAR,
         start_duration = start_effect ~= NONE and number(settings, 'start_duration', 0.5) or 0,
         end_duration = end_effect ~= NONE and number(settings, 'end_duration', 0.5) or 0,
         fade_in = start_effect == FADE and number(settings, 'start_duration', 0.5) or 0,
@@ -116,8 +137,10 @@ local function envelope(t, total, cfg)
         local scale = total / (si + so)
         si, so = si * scale, so * scale
     end
-    local start_progress = si > 0 and clamp(t / si, 0, 1) or 1
-    local end_progress = total and so > 0 and clamp((t - (total - so)) / so, 0, 1) or 0
+    local raw_start = si > 0 and clamp(t / si, 0, 1) or 1
+    local raw_end = total and so > 0 and clamp((t - (total - so)) / so, 0, 1) or 0
+    local start_progress = eased_progress(raw_start, cfg.start_easing)
+    local end_progress = eased_progress(raw_end, cfg.end_easing)
     local alpha = cfg.start_effect == FADE and start_progress or 1
     if cfg.end_effect == FADE then alpha = math.min(alpha, 1 - end_progress) end
     local phase = si > 0 and t < si and 'STARTING' or 'VISIBLE'
@@ -526,7 +549,8 @@ info.get_defaults = function(s)
     end
     for k, v in pairs({interval_mode = 0, first_display = 0, duration_mode = 0,
         start_effect = 1, end_effect = 1, start_direction = 2, end_direction = 6,
-        start_angle = 0, end_angle = 0, start_zoom_anchor = 4, end_zoom_anchor = 4}) do
+        start_angle = 0, end_angle = 0, start_zoom_anchor = 4, end_zoom_anchor = 4,
+        start_easing = LINEAR, end_easing = LINEAR}) do
         obs.obs_data_set_default_int(s, k, v)
     end
 end
@@ -685,6 +709,7 @@ local function layout(props, _, settings)
         local directional = selected == PEEK or selected == WIPE
         local zoom = selected == ZOOM
         obs.obs_property_set_visible(obs.obs_properties_get(props, prefix .. '_duration'), selected ~= NONE)
+        obs.obs_property_set_visible(obs.obs_properties_get(props, prefix .. '_easing'), selected ~= NONE)
         obs.obs_property_set_visible(obs.obs_properties_get(props, prefix .. '_direction'), directional)
         obs.obs_property_set_visible(obs.obs_properties_get(props, prefix .. '_angle'), directional
             and obs.obs_data_get_int(settings, prefix .. '_direction') == 8)
@@ -719,6 +744,9 @@ info.get_properties = function(d)
         local effect = add_list(group, entry[1] .. '_effect', '種類', {'なし', 'フェード', 'Peek', 'Wipe', 'Zoom'})
         obs.obs_property_set_modified_callback(effect, layout)
         add_seconds(group, entry[1] .. '_duration', '時間')
+        add_list(group, entry[1] .. '_easing', '変化のしかた', {
+            '一定', 'ゆっくり始まる', 'ゆっくり終わる',
+            'ゆっくり始まり、ゆっくり終わる'})
         local direction_property = add_list(group, entry[1] .. '_direction', '方向', {
             '↑ 上へ', '↗ 右上へ', '→ 右へ', '↘ 右下へ',
             '↓ 下へ', '↙ 左下へ', '← 左へ', '↖ 左上へ', '任意角度'})
@@ -774,7 +802,7 @@ local function frontend_event(event)
     elseif event == obs.OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGED then exiting = false end
 end
 function script_description()
-    return 'ソース定期表示（Ambient Source Events）0.4.0\n' ..
+    return 'ソース定期表示（Ambient Source Events）0.5.0\n' ..
         '各ソースの「フィルタ → ＋ → ソース定期表示」から追加してください。\n' ..
         '映像の定期表示・フェード・Peek・Wipe・Zoomと非表示中の消音。対応条件はREADME-ja.mdをご確認ください。'
 end

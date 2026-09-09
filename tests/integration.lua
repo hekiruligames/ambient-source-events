@@ -36,6 +36,7 @@ local outcome, cleanup_frame, render_registered, cleanup_failed = nil, nil, fals
 local snapshots, history = {}, {}
 local scene_a, scene_b, image, peek, peek_angle, wipe_horizontal, wipe_vertical
 local wipe_diagonal, wipe_angle, zoom_reference, zoom_shrink, zoom_grow, zoom_zero
+local easing_fade
 local white, media, gif_image, gif_media, text_source
 local original_load, original_unload, original_tick
 local integration_seconds = tonumber(os.getenv('ASE_INTEGRATION_SECONDS') or '14')
@@ -147,7 +148,8 @@ local function make_source(kind, name, values, options)
     obs.obs_scene_add(scene_a,p)
     local settings=obs.obs_data_create()
     for k,v in pairs(options or {}) do
-        if k:find('effect') or k:find('mode') or k:find('direction') or k:find('angle') or k:find('anchor')
+        if k:find('effect') or k:find('mode') or k:find('direction') or k:find('angle')
+                or k:find('anchor') or k:find('easing')
                 or k=='first_display' then obs.obs_data_set_int(settings,k,v)
         else obs.obs_data_set_double(settings,k,v) end
     end
@@ -212,6 +214,9 @@ local function setup()
     zoom_zero=make_source('image_source','ASE Zoom zero PNG',{file=root..'alpha.png'},
         {first_display=1,interval=1,display_duration=2,start_effect=4,end_effect=0,
             start_duration=0.5,start_zoom_percent=0,start_zoom_anchor=4})
+    easing_fade=make_source('image_source','ASE Easing Fade',{file=root..'alpha.png'},
+        {first_display=1,interval=1,display_duration=2,start_effect=1,end_effect=1,
+            start_duration=1,end_duration=1,start_easing=0,end_easing=3})
     white=make_source('color_source','ASE white',{color=0xffffffff,width=320,height=180},
         {first_display=1,interval=1,display_duration=2,start_duration=0.5,end_duration=0.5})
     media=make_source('ffmpeg_source','ASE video',{is_local_file=true,local_file=root..'video.mp4',
@@ -255,6 +260,22 @@ local function step(dt)
         check(obs.obs_source_muted(media.parent),'Inactive source muted')
         obs.obs_set_output_source(0,obs.obs_scene_get_source(scene_a)); switches=3
     end
+    if easing_fade then
+        local ed=easing_fade.data
+        local start_mode=ed.cfg.start_easing
+        local end_mode=ed.cfg.end_easing
+        if ed.state=='ENDING' and start_mode<3
+                and snapshots['easing-start-'..start_mode]
+                and snapshots['easing-end-'..end_mode]
+                and not snapshots['easing-advanced-'..start_mode] then
+            local settings=obs.obs_source_get_settings(easing_fade.filter)
+            obs.obs_data_set_int(settings,'start_easing',start_mode+1)
+            obs.obs_data_set_int(settings,'end_easing',2-start_mode)
+            obs.obs_source_update(easing_fade.filter,settings)
+            obs.obs_data_release(settings)
+            snapshots['easing-advanced-'..start_mode]=true
+        end
+    end
     if time>integration_seconds and not snapshots.disabled then
         check(switches==3,'Scene pause/resume completed')
         check(d.generation>=3,'Real Media Source restarts across multiple ended cycles')
@@ -273,6 +294,11 @@ local function step(dt)
         for _,zoom in ipairs({zoom_shrink,zoom_grow,zoom_zero}) do
             check(obs.obs_source_get_width(zoom.filter)==320 and obs.obs_source_get_height(zoom.filter)==180,
                 'Zoom keeps Scene Item source dimensions: '..zoom.name)
+        end
+        for easing_mode=0,3 do
+            check(snapshots['easing-start-'..easing_mode]
+                    and snapshots['easing-end-'..easing_mode],
+                'Captured easing mode '..easing_mode..' through real OBS settings and GPU rendering')
         end
         obs.obs_source_set_enabled(image.filter,false)
         snapshots.disabled='pending'
@@ -330,8 +356,45 @@ local function check_zoom_pixels(zoom, label, scale, anchor_x, anchor_y, options
     check(zoom.data.alpha==1,label..' does not change opacity')
     snapshots[label]=pixels
 end
+local function easing_value(t, mode)
+    t=math.max(0,math.min(1,t))
+    if t==0 or t==1 or mode==0 then return t end
+    if mode==1 then return t*t*t end
+    if mode==2 then return 1-(1-t)*(1-t)*(1-t) end
+    return t<0.5 and 4*t*t*t or 1-((-2*t+2)^3)/2
+end
+local function check_easing_fades()
+    if not easing_fade then return end
+    for _,phase in ipairs({'STARTING','ENDING'}) do
+        local d=easing_fade.data
+        local mode=phase=='STARTING' and d.cfg.start_easing or d.cfg.end_easing
+        local snapshot_key=(phase=='STARTING' and 'easing-start-' or 'easing-end-')..mode
+        if not snapshots[snapshot_key] then
+            if d.owns and d.active and d.state==phase and d.total then
+                local raw=phase=='STARTING' and d.elapsed/d.cfg.start_duration
+                    or (d.elapsed-(d.total-d.cfg.end_duration))/d.cfg.end_duration
+                if raw>0.2 and raw<0.3 then
+                    local expected=easing_value(raw,mode)
+                    local progress=phase=='STARTING' and d.start_progress or d.end_progress
+                    local alpha=phase=='STARTING' and expected or 1-expected
+                    check(near(progress,expected,1e-6),
+                        phase..' applies easing mode '..mode..' to progress')
+                    check(near(d.alpha,alpha,1e-6),
+                        phase..' easing mode '..mode..' drives Fade opacity only')
+                    check(d.cfg.end_easing==3-d.cfg.start_easing,
+                        'Real OBS keeps independent start and end easing settings')
+                    local pixels=capture(easing_fade.name,snapshot_key)
+                    check(math.abs(pixels[1][4]-math.floor(alpha*255+0.5))<=2,
+                        phase..' easing mode '..mode..' reaches GPU opacity')
+                    snapshots[snapshot_key]=true
+                end
+            end
+        end
+    end
+end
 local function render()
     if done or not image then return end
+    check_easing_fades()
     local d=image.data
     local pd=peek.data
     if pd.owns and pd.active and pd.state=='STARTING' and pd.start_progress<0.05
