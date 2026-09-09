@@ -20,7 +20,9 @@ local function test()
     replace('obs_enter_graphics', function() end)
     replace('obs_leave_graphics', function() end)
     local rendered_alpha, rendered_offset_x, rendered_offset_y, rendered_wipe_x, rendered_wipe_y
-    local rendered_wipe_progress, rendered_wipe_mode, bypassed
+    local rendered_wipe_progress, rendered_wipe_mode, rendered_zoom_visible, bypassed
+    local rendered_translate_x, rendered_translate_y, rendered_scale_x, rendered_scale_y
+    local matrix_depth = 0
     replace('obs_source_skip_video_filter', function() bypassed = true end)
     replace('obs_source_process_filter_begin', function() return true end)
     replace('obs_source_process_filter_end', function() end)
@@ -31,11 +33,20 @@ local function test()
         elseif param == 'wipe_x' then rendered_wipe_x = value
         elseif param == 'wipe_y' then rendered_wipe_y = value
         elseif param == 'wipe_progress' then rendered_wipe_progress = value
-        elseif param == 'wipe_mode' then rendered_wipe_mode = value end
+        elseif param == 'wipe_mode' then rendered_wipe_mode = value
+        elseif param == 'zoom_visible' then rendered_zoom_visible = value end
     end)
     replace('gs_blend_state_push', function() end)
     replace('gs_blend_function', function() end)
     replace('gs_blend_state_pop', function() end)
+    replace('gs_matrix_push', function() matrix_depth = matrix_depth + 1 end)
+    replace('gs_matrix_pop', function() matrix_depth = matrix_depth - 1 end)
+    replace('gs_matrix_translate3f', function(x, y)
+        rendered_translate_x, rendered_translate_y = x, y
+    end)
+    replace('gs_matrix_scale3f', function(x, y)
+        rendered_scale_x, rendered_scale_y = x, y
+    end)
     replace('obs_source_get_signal_handler', function(p) return p.signals end)
     replace('signal_handler_connect', function(h, signal, callback)
         h[signal] = h[signal] or {}; h[signal][callback] = true
@@ -80,7 +91,7 @@ local function test()
         source.get_defaults(settings)
         for k, v in pairs(options or {}) do
             if k:find('effect') or k:find('mode') or k:find('direction')
-                    or k:find('angle') or k == 'first_display' then
+                    or k:find('angle') or k:find('anchor') or k == 'first_display' then
                 obs.obs_data_set_int(settings, k, v)
             else obs.obs_data_set_double(settings, k, v) end
         end
@@ -245,6 +256,69 @@ local function test()
     tick(d, p, 0.25)
     check(d.state == 'WAITING' and p.muted, 'Wipe Out finishes fully hidden')
     destroy(d, p, f)
+
+    d, p, f = make({display_duration = 2, start_effect = 4, start_duration = 0.5,
+        start_zoom_percent = 50, start_zoom_anchor = 4, end_effect = 4, end_duration = 0.5,
+        end_zoom_percent = 50, end_zoom_anchor = 8}, false)
+    check(d.state == 'STARTING' and d.alpha == 1 and d.start_progress == 0,
+        'Zoom In starts at its configured scale without changing opacity')
+    local anchors = {
+        {0, 0}, {0.5, 0}, {1, 0}, {0, 0.5}, {0.5, 0.5},
+        {1, 0.5}, {0, 1}, {0.5, 1}, {1, 1},
+    }
+    for anchor_index, anchor in ipairs(anchors) do
+        d.cfg.start_zoom_anchor = anchor_index - 1
+        source.video_render(d)
+        check(near(rendered_scale_x, 0.5) and near(rendered_scale_y, 0.5)
+                and near(rendered_translate_x, 320 * anchor[1] * 0.5)
+                and near(rendered_translate_y, 180 * anchor[2] * 0.5),
+            'Zoom anchor calculation ' .. (anchor_index - 1))
+    end
+    d.cfg.start_zoom_anchor = 4
+    tick(d, p, 0.25); source.video_render(d)
+    check(near(rendered_scale_x, 0.75) and near(rendered_scale_y, 0.75)
+            and near(rendered_translate_x, 40) and near(rendered_translate_y, 22.5)
+            and rendered_zoom_visible == 1 and d.alpha == 1,
+        '50 to 100 percent Zoom In is linear, centered, aspect-preserving, and opacity-neutral')
+    tick(d, p, 0.25); source.video_render(d)
+    check(d.state == 'VISIBLE' and rendered_scale_x == 1 and rendered_scale_y == 1,
+        'Zoom In reaches unchanged 100 percent')
+    tick(d, p, 1.25); source.video_render(d)
+    check(d.state == 'ENDING' and near(rendered_scale_x, 0.75) and near(rendered_scale_y, 0.75)
+            and near(rendered_translate_x, 80) and near(rendered_translate_y, 45)
+            and d.cfg.start_zoom_anchor == 4 and d.cfg.end_zoom_anchor == 8,
+        '100 to 50 percent Zoom Out uses its independent bottom-right anchor')
+    check(source.get_width(d) == 320 and source.get_height(d) == 180,
+        'Zoom preserves reported source dimensions while drawing beyond them')
+    destroy(d, p, f)
+
+    d, p, f = make({display_duration = 2, start_effect = 4, start_duration = 0.5,
+        start_zoom_percent = 150, start_zoom_anchor = 2, end_effect = 4, end_duration = 0.5,
+        end_zoom_percent = 200, end_zoom_anchor = 6}, false)
+    source.video_render(d)
+    check(near(rendered_scale_x, 1.5) and near(rendered_scale_y, 1.5)
+            and near(rendered_translate_x, -160) and rendered_translate_y == 0,
+        'Zoom In supports above 100 percent from the top-right anchor')
+    tick(d, p, 1.75); source.video_render(d)
+    check(d.state == 'ENDING' and near(rendered_scale_x, 1.5) and near(rendered_scale_y, 1.5)
+            and rendered_translate_x == 0 and near(rendered_translate_y, -90),
+        'Zoom Out supports above 100 percent with an independent bottom-left anchor')
+    destroy(d, p, f)
+
+    d, p, f = make({display_duration = 1, start_effect = 4, start_duration = 0.5,
+        start_zoom_percent = 0, end_effect = 0}, false)
+    rendered_scale_x, rendered_scale_y, rendered_translate_x, rendered_translate_y = nil, nil, nil, nil
+    source.video_render(d)
+    check(rendered_zoom_visible == 0 and rendered_scale_x == nil and rendered_scale_y == nil
+            and d.alpha == 1 and p.muted,
+        'Zero percent Zoom renders transparent without a singular matrix or opacity change')
+    tick(d, p, 0.25); source.video_render(d)
+    check(near(rendered_scale_x, 0.5) and near(rendered_scale_y, 0.5)
+            and rendered_zoom_visible == 1 and not p.muted,
+        'Zero percent Zoom enters the normal linear scale path after its endpoint')
+    destroy(d, p, f)
+    check(matrix_depth == 0, 'Zoom rendering restores the graphics matrix stack')
+
     d, p, f = make({first_display = 1, interval = -1, random_min = -2, random_max = -3,
         display_duration = -1, start_duration = -1, end_duration = -1}, false)
     check(d.cfg.interval == 0 and d.cfg.lo == 0 and d.cfg.hi == 0, 'Negative stored waits normalize to zero')
@@ -326,7 +400,8 @@ local function test()
 
     local settings = obs.obs_data_create(); source.get_defaults(settings)
     local props = source.get_properties(nil)
-    for _, key in ipairs({'interval', 'random_min', 'random_max', 'display_duration', 'start_duration', 'end_duration'}) do
+    for _, key in ipairs({'interval', 'random_min', 'random_max', 'display_duration', 'start_duration',
+            'end_duration', 'start_zoom_percent', 'end_zoom_percent'}) do
         local property = obs.obs_properties_get(props, key)
         check(property ~= nil, 'Numeric property exists: ' .. key)
         check(not obs.obs_property_modified(property, settings), 'Numbers do not rebuild properties: ' .. key)
@@ -351,6 +426,33 @@ local function test()
     check(obs.obs_property_modified(obs.obs_properties_get(props, 'start_direction'), settings)
             and obs.obs_property_visible(obs.obs_properties_get(props, 'start_angle')),
         'Custom direction alone shows the angle field')
+    obs.obs_data_set_int(settings, 'start_effect', 4)
+    check(obs.obs_property_modified(obs.obs_properties_get(props, 'start_effect'), settings)
+            and obs.obs_property_visible(obs.obs_properties_get(props, 'start_zoom_anchor'))
+            and obs.obs_property_visible(obs.obs_properties_get(props, 'start_zoom_percent'))
+            and not obs.obs_property_visible(obs.obs_properties_get(props, 'start_direction'))
+            and not obs.obs_property_visible(obs.obs_properties_get(props, 'start_angle')),
+        'Zoom selection shows only anchor, percent, and duration controls')
+    check(obs.obs_data_get_double(settings, 'start_zoom_percent') == 50
+            and obs.obs_data_get_double(settings, 'end_zoom_percent') == 50
+            and obs.obs_data_get_int(settings, 'start_zoom_anchor') == 4
+            and obs.obs_data_get_int(settings, 'end_zoom_anchor') == 4,
+        'Zoom defaults are 50 percent and centered independently')
+    local anchor_items = {
+        {'● 中央', 4}, {'↑ 上', 1}, {'↗ 右上', 2},
+        {'→ 右', 5}, {'↘ 右下', 8}, {'↓ 下', 7},
+        {'↙ 左下', 6}, {'← 左', 3}, {'↖ 左上', 0},
+    }
+    for _, prefix in ipairs({'start', 'end'}) do
+        local property = obs.obs_properties_get(props, prefix .. '_zoom_anchor')
+        check(obs.obs_property_list_item_count(property) == #anchor_items,
+            prefix .. ' Zoom shows exactly nine anchors')
+        for index, anchor in ipairs(anchor_items) do
+            check(obs.obs_property_list_item_name(property, index - 1) == anchor[1]
+                    and obs.obs_property_list_item_int(property, index - 1) == anchor[2],
+                prefix .. ' Zoom anchor display order and stored value ' .. index)
+        end
+    end
     check(obs.obs_data_get_int(settings, 'end_direction') == 6,
         'Default Peek directions are start right and end left')
     local product_file=assert(io.open('ambient-source-events.lua','r'))

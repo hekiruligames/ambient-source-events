@@ -1,11 +1,11 @@
--- Ambient Source Events 0.3.0 / OBS Studio 32.0.4
+-- Ambient Source Events 0.4.0 / OBS Studio 32.0.4
 -- Source timing belongs to video_tick; video_render never advances time.
 local obs = obslua
 local bit = require('bit')
 local ID = 'lua_ambient_source_events_v1'
 local TITLE = 'ソース定期表示'
-local LIMIT, WATCHDOG = 86400, 10
-local NONE, FADE, PEEK, WIPE = 0, 1, 2, 3
+local LIMIT, WATCHDOG, ZOOM_UI_MAX = 86400, 10, 1000000
+local NONE, FADE, PEEK, WIPE, ZOOM = 0, 1, 2, 3, 4
 local instances, owners, restore_jobs = {}, {}, {}
 local disconnect_jobs = {}
 local exiting, unloading = false, false
@@ -21,12 +21,15 @@ uniform float wipe_x;
 uniform float wipe_y;
 uniform float wipe_progress;
 uniform float wipe_mode;
+uniform float zoom_visible;
 sampler_state textureSampler { Filter = Linear; AddressU = Clamp; AddressV = Clamp; };
 struct VertData { float4 pos : POSITION; float2 uv : TEXCOORD0; };
 VertData VSDefault(VertData v) {
     VertData o; o.pos = mul(float4(v.pos.xyz, 1.0), ViewProj); o.uv = v.uv; return o;
 }
 float4 PSOpacity(VertData v) : TARGET {
+    if (zoom_visible < 0.5)
+        return float4(0.0, 0.0, 0.0, 0.0);
     float2 sample_uv = v.uv - float2(offset_x, offset_y);
     if (sample_uv.x < 0.0 || sample_uv.x > 1.0 || sample_uv.y < 0.0 || sample_uv.y > 1.0)
         return float4(0.0, 0.0, 0.0, 0.0);
@@ -51,13 +54,21 @@ local function number(settings, key, default, lo)
     return clamp(x, lo or 0, LIMIT)
 end
 local function effect(settings, key)
-    return clamp(obs.obs_data_get_int(settings, key), NONE, WIPE)
+    return clamp(obs.obs_data_get_int(settings, key), NONE, ZOOM)
 end
 local function direction(settings, key)
     return clamp(obs.obs_data_get_int(settings, key), 0, 8)
 end
 local function angle(settings, key)
     return obs.obs_data_get_int(settings, key) % 360
+end
+local function zoom_anchor(settings, key)
+    return clamp(obs.obs_data_get_int(settings, key), 0, 8)
+end
+local function zoom_scale(settings, key)
+    local percent = obs.obs_data_get_double(settings, key)
+    if not finite(percent) then percent = 50 end
+    return clamp(percent, 0, ZOOM_UI_MAX) / 100
 end
 local function config(settings)
     local lo = number(settings, 'random_min', 20)
@@ -80,7 +91,24 @@ local function config(settings)
         end_direction = direction(settings, 'end_direction'),
         start_angle = angle(settings, 'start_angle'),
         end_angle = angle(settings, 'end_angle'),
+        start_zoom_anchor = zoom_anchor(settings, 'start_zoom_anchor'),
+        end_zoom_anchor = zoom_anchor(settings, 'end_zoom_anchor'),
+        start_zoom_scale = zoom_scale(settings, 'start_zoom_percent'),
+        end_zoom_scale = zoom_scale(settings, 'end_zoom_percent'),
     }
+end
+local function zoom_transform(d, width, height)
+    local cfg, scale, anchor_index = d.cfg, 1, 4
+    if d.state == 'STARTING' and cfg.start_effect == ZOOM then
+        scale = cfg.start_zoom_scale + (1 - cfg.start_zoom_scale) * d.start_progress
+        anchor_index = cfg.start_zoom_anchor
+    elseif d.state == 'ENDING' and cfg.end_effect == ZOOM then
+        scale = 1 + (cfg.end_zoom_scale - 1) * d.end_progress
+        anchor_index = cfg.end_zoom_anchor
+    else return 1, 0, 0 end
+    local anchor_x = (anchor_index % 3) / 2
+    local anchor_y = math.floor(anchor_index / 3) / 2
+    return scale, width * anchor_x * (1 - scale), height * anchor_y * (1 - scale)
 end
 local function envelope(t, total, cfg)
     local si, so = cfg.start_duration, cfg.end_duration
@@ -479,9 +507,11 @@ local function update_instance(d, seconds)
     elseif d.media then media_tick(d, p, seconds)
     else persistent_tick(d, p, seconds) end
     local boundary_hidden = (d.state == 'STARTING'
-            and (d.cfg.start_effect == PEEK or d.cfg.start_effect == WIPE)
+            and (d.cfg.start_effect == PEEK or d.cfg.start_effect == WIPE
+                or (d.cfg.start_effect == ZOOM and d.cfg.start_zoom_scale == 0))
             and d.start_progress <= 0)
-        or (d.state == 'ENDING' and (d.cfg.end_effect == PEEK or d.cfg.end_effect == WIPE)
+        or (d.state == 'ENDING' and (d.cfg.end_effect == PEEK or d.cfg.end_effect == WIPE
+                or (d.cfg.end_effect == ZOOM and d.cfg.end_zoom_scale == 0))
             and d.end_progress >= 1)
     mute(d, p, d.alpha <= 0 or boundary_hidden or (d.media and not d.ready))
 end
@@ -490,12 +520,15 @@ local info = {id = ID, type = obs.OBS_SOURCE_TYPE_FILTER, output_flags = obs.OBS
 info.get_name = function() return TITLE end
 info.get_defaults = function(s)
     for k, v in pairs({interval = 30, random_min = 20, random_max = 60,
-        display_duration = 5, start_duration = 0.5, end_duration = 0.5}) do
+        display_duration = 5, start_duration = 0.5, end_duration = 0.5,
+        start_zoom_percent = 50, end_zoom_percent = 50}) do
         obs.obs_data_set_default_double(s, k, v)
     end
     for k, v in pairs({interval_mode = 0, first_display = 0, duration_mode = 0,
         start_effect = 1, end_effect = 1, start_direction = 2, end_direction = 6,
-        start_angle = 0, end_angle = 0}) do obs.obs_data_set_default_int(s, k, v) end
+        start_angle = 0, end_angle = 0, start_zoom_anchor = 4, end_zoom_anchor = 4}) do
+        obs.obs_data_set_default_int(s, k, v)
+    end
 end
 info.create = function(settings, source)
     serial = serial + 1
@@ -517,6 +550,7 @@ info.create = function(settings, source)
         d.wipe_y_param = obs.gs_effect_get_param_by_name(d.effect, 'wipe_y')
         d.wipe_progress_param = obs.gs_effect_get_param_by_name(d.effect, 'wipe_progress')
         d.wipe_mode_param = obs.gs_effect_get_param_by_name(d.effect, 'wipe_mode')
+        d.zoom_visible_param = obs.gs_effect_get_param_by_name(d.effect, 'zoom_visible')
     end
     obs.obs_leave_graphics()
     if not d.effect then
@@ -574,6 +608,7 @@ info.video_render = function(d)
         local height = target and obs.obs_source_get_base_height(target) or 0
         local offset_x, offset_y = peek_offset(d, width, height)
         local wipe_x, wipe_y, wipe_progress, wipe_mode = effect_direction(d, WIPE)
+        local scale, translate_x, translate_y = zoom_transform(d, width, height)
         obs.gs_effect_set_float(d.opacity_param, clamp(alpha, 0, 1))
         obs.gs_effect_set_float(d.offset_x_param, offset_x)
         obs.gs_effect_set_float(d.offset_y_param, offset_y)
@@ -581,9 +616,16 @@ info.video_render = function(d)
         obs.gs_effect_set_float(d.wipe_y_param, wipe_y)
         obs.gs_effect_set_float(d.wipe_progress_param, wipe_progress)
         obs.gs_effect_set_float(d.wipe_mode_param, wipe_mode)
+        obs.gs_effect_set_float(d.zoom_visible_param, scale > 0 and 1 or 0)
         obs.gs_blend_state_push()
         obs.gs_blend_function(obs.GS_BLEND_ONE, obs.GS_BLEND_INVSRCALPHA)
+        obs.gs_matrix_push()
+        if scale > 0 then
+            obs.gs_matrix_translate3f(translate_x, translate_y, 0)
+            obs.gs_matrix_scale3f(scale, scale, 1)
+        end
         obs.obs_source_process_filter_end(d.context, d.effect, 0, 0)
+        obs.gs_matrix_pop()
         obs.gs_blend_state_pop()
     end
 end
@@ -641,10 +683,13 @@ local function layout(props, _, settings)
     for _, prefix in ipairs({'start', 'end'}) do
         local selected = obs.obs_data_get_int(settings, prefix .. '_effect')
         local directional = selected == PEEK or selected == WIPE
+        local zoom = selected == ZOOM
         obs.obs_property_set_visible(obs.obs_properties_get(props, prefix .. '_duration'), selected ~= NONE)
         obs.obs_property_set_visible(obs.obs_properties_get(props, prefix .. '_direction'), directional)
         obs.obs_property_set_visible(obs.obs_properties_get(props, prefix .. '_angle'), directional
             and obs.obs_data_get_int(settings, prefix .. '_direction') == 8)
+        obs.obs_property_set_visible(obs.obs_properties_get(props, prefix .. '_zoom_anchor'), zoom)
+        obs.obs_property_set_visible(obs.obs_properties_get(props, prefix .. '_zoom_percent'), zoom)
     end
     return true
 end
@@ -671,7 +716,7 @@ info.get_properties = function(d)
     obs.obs_property_set_visible(display, not media)
     for _, entry in ipairs({{'start', '開始エフェクト'}, {'end', '終了エフェクト'}}) do
         group = obs.obs_properties_create()
-        local effect = add_list(group, entry[1] .. '_effect', '種類', {'なし', 'フェード', 'Peek', 'Wipe'})
+        local effect = add_list(group, entry[1] .. '_effect', '種類', {'なし', 'フェード', 'Peek', 'Wipe', 'Zoom'})
         obs.obs_property_set_modified_callback(effect, layout)
         add_seconds(group, entry[1] .. '_duration', '時間')
         local direction_property = add_list(group, entry[1] .. '_direction', '方向', {
@@ -681,6 +726,18 @@ info.get_properties = function(d)
         local angle_property = obs.obs_properties_add_int(group, entry[1] .. '_angle',
             '角度', 0, 359, 1)
         obs.obs_property_int_set_suffix(angle_property, '°')
+        local zoom_anchor_property = obs.obs_properties_add_list(group,
+            entry[1] .. '_zoom_anchor', 'ズーム基準点',
+            obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_INT)
+        for _, anchor in ipairs({
+                {'● 中央', 4}, {'↑ 上', 1}, {'↗ 右上', 2},
+                {'→ 右', 5}, {'↘ 右下', 8}, {'↓ 下', 7},
+                {'↙ 左下', 6}, {'← 左', 3}, {'↖ 左上', 0}}) do
+            obs.obs_property_list_add_int(zoom_anchor_property, anchor[1], anchor[2])
+        end
+        local zoom_percent = obs.obs_properties_add_float(group, entry[1] .. '_zoom_percent',
+            '倍率', 0, ZOOM_UI_MAX, 0.1)
+        obs.obs_property_float_set_suffix(zoom_percent, ' %')
         obs.obs_properties_add_group(props, entry[1], entry[2], obs.OBS_GROUP_NORMAL, group)
     end
     local message = d and d.notice or ''
@@ -717,9 +774,9 @@ local function frontend_event(event)
     elseif event == obs.OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGED then exiting = false end
 end
 function script_description()
-    return 'ソース定期表示（Ambient Source Events）0.3.0\n' ..
+    return 'ソース定期表示（Ambient Source Events）0.4.0\n' ..
         '各ソースの「フィルタ → ＋ → ソース定期表示」から追加してください。\n' ..
-        '映像の定期表示・フェード・Peek・Wipeと非表示中の消音。対応条件はREADME-ja.mdをご確認ください。'
+        '映像の定期表示・フェード・Peek・Wipe・Zoomと非表示中の消音。対応条件はREADME-ja.mdをご確認ください。'
 end
 function script_load()
     exiting, unloading = false, false

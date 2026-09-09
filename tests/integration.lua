@@ -26,6 +26,8 @@ void gs_clear(unsigned int, const struct vec4 *, float, unsigned char);
 void gs_ortho(float,float,float,float,float,float);
 void gs_blend_state_push(void); void gs_blend_state_pop(void);
 void gs_blend_function(int,int);
+void gs_matrix_push(void); void gs_matrix_pop(void);
+void gs_matrix_translate3f(float,float,float);
 ]]
 local C = ffi.load('/Applications/OBS.app/Contents/Frameworks/libobs.framework/libobs')
 local live, resources, count = {}, {}, 0
@@ -33,7 +35,8 @@ local done, time, switches, pause_started, pause_position, pause_alpha = false, 
 local outcome, cleanup_frame, render_registered, cleanup_failed = nil, nil, false, false
 local snapshots, history = {}, {}
 local scene_a, scene_b, image, peek, peek_angle, wipe_horizontal, wipe_vertical
-local wipe_diagonal, wipe_angle, white, media, gif_image, gif_media, text_source
+local wipe_diagonal, wipe_angle, zoom_reference, zoom_shrink, zoom_grow, zoom_zero
+local white, media, gif_image, gif_media, text_source
 local original_load, original_unload, original_tick
 local integration_seconds = tonumber(os.getenv('ASE_INTEGRATION_SECONDS') or '14')
 assert(integration_seconds and integration_seconds >= 14, 'ASE_INTEGRATION_SECONDS must be at least 14')
@@ -63,37 +66,48 @@ local function fail_cleanup(reason)
     publish('verification/cleanup-ready.txt',outcome)
     publish('verification/test-result.txt',outcome)
 end
-local function capture(name, label, background)
-    local graphics_entered, render_begun, blend_pushed, mapped = false, false, false, false
+local function capture(name, label, background, options)
+    options = options or {}
+    local width, height = options.width or 320, options.height or 180
+    local graphics_entered, render_begun, blend_pushed, matrix_pushed, mapped = false, false, false, false, false
     local target, stage, source
     local rows, result
     local ok, reason = xpcall(function()
         C.obs_enter_graphics(); graphics_entered = true
         target = C.gs_texrender_create(obs.GS_RGBA, obs.GS_ZS_NONE)
-        stage = C.gs_stagesurface_create(320,180,obs.GS_RGBA)
+        stage = C.gs_stagesurface_create(width,height,obs.GS_RGBA)
         source = C.obs_get_source_by_name(name)
         assert(source ~= nil, 'Capture source unavailable')
         assert(target ~= nil, 'Capture texrender unavailable')
         assert(stage ~= nil, 'Capture stagesurface unavailable')
-        assert(C.gs_texrender_begin(target,320,180)); render_begun = true
+        assert(C.gs_texrender_begin(target,width,height)); render_begun = true
         C.gs_blend_state_push(); blend_pushed = true
         C.gs_blend_function(obs.GS_BLEND_SRCALPHA,obs.GS_BLEND_INVSRCALPHA)
         C.gs_clear(obs.GS_CLEAR_COLOR,background or ffi.new('struct vec4'),0,0)
-        C.gs_ortho(0,320,0,180,-100,100)
+        C.gs_ortho(0,width,0,height,-100,100)
+        if options.translate_x or options.translate_y then
+            C.gs_matrix_push(); matrix_pushed = true
+            C.gs_matrix_translate3f(options.translate_x or 0,options.translate_y or 0,0)
+        end
         C.obs_source_video_render(source)
+        if matrix_pushed then C.gs_matrix_pop(); matrix_pushed = false end
         C.gs_blend_state_pop(); blend_pushed = false
         C.gs_texrender_end(target); render_begun = false
         C.gs_stage_texture(stage,C.gs_texrender_get_texture(target))
         local bytes, stride = ffi.new('unsigned char *[1]'), ffi.new('unsigned int[1]')
         assert(C.gs_stagesurface_map(stage,bytes,stride), 'GPU readback failed'); mapped = true
         rows = {}
-        for y=0,179 do rows[#rows+1] = ffi.string(bytes[0]+y*stride[0],1280) end
+        for y=0,height-1 do rows[#rows+1] = ffi.string(bytes[0]+y*stride[0],width*4) end
         local function pixel(x,y)
             local off = y*stride[0]+x*4
             return {tonumber(bytes[0][off]),tonumber(bytes[0][off+1]),tonumber(bytes[0][off+2]),tonumber(bytes[0][off+3])}
         end
-        result = {pixel(80,45),pixel(240,45),pixel(80,135),pixel(240,135),
-            pixel(120,30),pixel(200,150),pixel(40,110),pixel(280,70)}
+        local samples = options.samples or {
+            {80,45},{240,45},{80,135},{240,135},
+            {120,30},{200,150},{40,110},{280,70},
+        }
+        result = {}
+        for _,sample in ipairs(samples) do result[#result+1]=pixel(sample[1],sample[2]) end
     end, debug.traceback)
     -- Always unwind resources acquired above, including when an assert fails.
     local cleanup_errors = {}
@@ -104,6 +118,7 @@ local function capture(name, label, background)
         if not cleanup_ok then cleanup_errors[#cleanup_errors+1] = label..': '..tostring(cleanup_reason) end
     end
     if mapped then cleanup_call('stagesurface_unmap',C.gs_stagesurface_unmap,stage) end
+    if matrix_pushed then cleanup_call('matrix_pop',C.gs_matrix_pop) end
     if blend_pushed then cleanup_call('blend_state_pop',C.gs_blend_state_pop) end
     if render_begun then cleanup_call('texrender_end',C.gs_texrender_end,target) end
     if stage ~= nil then cleanup_call('stagesurface_destroy',C.gs_stagesurface_destroy,stage) end
@@ -132,7 +147,7 @@ local function make_source(kind, name, values, options)
     obs.obs_scene_add(scene_a,p)
     local settings=obs.obs_data_create()
     for k,v in pairs(options or {}) do
-        if k:find('effect') or k:find('mode') or k:find('direction') or k:find('angle')
+        if k:find('effect') or k:find('mode') or k:find('direction') or k:find('angle') or k:find('anchor')
                 or k=='first_display' then obs.obs_data_set_int(settings,k,v)
         else obs.obs_data_set_double(settings,k,v) end
     end
@@ -184,6 +199,19 @@ local function setup()
         {first_display=1,interval=1,display_duration=2,start_effect=3,end_effect=3,
             start_duration=0.5,end_duration=0.5,start_direction=8,start_angle=30,
             end_direction=8,end_angle=210})
+    zoom_reference=make_source('image_source','ASE Zoom reference PNG',{file=root..'alpha.png'},
+        {first_display=1,interval=1,display_duration=2,start_effect=0,end_effect=0})
+    zoom_shrink=make_source('image_source','ASE Zoom shrink PNG',{file=root..'alpha.png'},
+        {first_display=1,interval=1,display_duration=2,start_effect=4,end_effect=4,
+            start_duration=0.5,end_duration=0.5,start_zoom_percent=50,end_zoom_percent=50,
+            start_zoom_anchor=4,end_zoom_anchor=8})
+    zoom_grow=make_source('image_source','ASE Zoom grow PNG',{file=root..'alpha.png'},
+        {first_display=1,interval=1,display_duration=2,start_effect=4,end_effect=4,
+            start_duration=0.5,end_duration=0.5,start_zoom_percent=200,end_zoom_percent=200,
+            start_zoom_anchor=2,end_zoom_anchor=7})
+    zoom_zero=make_source('image_source','ASE Zoom zero PNG',{file=root..'alpha.png'},
+        {first_display=1,interval=1,display_duration=2,start_effect=4,end_effect=0,
+            start_duration=0.5,start_zoom_percent=0,start_zoom_anchor=4})
     white=make_source('color_source','ASE white',{color=0xffffffff,width=320,height=180},
         {first_display=1,interval=1,display_duration=2,start_duration=0.5,end_duration=0.5})
     media=make_source('ffmpeg_source','ASE video',{is_local_file=true,local_file=root..'video.mp4',
@@ -242,6 +270,10 @@ local function step(dt)
             check(obs.obs_source_get_width(wipe.filter)==320 and obs.obs_source_get_height(wipe.filter)==180,
                 'Wipe keeps the source output size: '..wipe.name)
         end
+        for _,zoom in ipairs({zoom_shrink,zoom_grow,zoom_zero}) do
+            check(obs.obs_source_get_width(zoom.filter)==320 and obs.obs_source_get_height(zoom.filter)==180,
+                'Zoom keeps Scene Item source dimensions: '..zoom.name)
+        end
         obs.obs_source_set_enabled(image.filter,false)
         snapshots.disabled='pending'
     elseif snapshots.disabled=='pending' and time>integration_seconds+0.2 then
@@ -254,7 +286,8 @@ local function step(dt)
         check(not obs.obs_source_muted(media.parent),'Removal restores original unmuted state')
         check(obs.obs_source_media_get_state(media.parent)==obs.OBS_MEDIA_STATE_PLAYING,'Removal restores playback')
         for _,key in ipairs({'waiting','half','visible','ending','peek-start-outside','peek-end-outside',
-                'wipe-start-hidden','wipe-end-hidden'}) do
+                'wipe-start-hidden','wipe-end-hidden','zoom-zero','zoom-shrink-in-half',
+                'zoom-shrink-out-half','zoom-grow-in','zoom-grow-out'}) do
             check(snapshots[key]~=nil,'Captured GPU '..key)
         end
         write_result(true)
@@ -274,6 +307,28 @@ local function check_wipe_mask(pixels, visible, hidden, reference, label)
         check(pixels[index][1]==0 and pixels[index][2]==0 and pixels[index][3]==0
                 and pixels[index][4]==0, label..' hidden sample '..index)
     end
+end
+local function zoom_samples(scale, anchor_x, anchor_y, offset_x, offset_y)
+    local result = {}
+    for _,point in ipairs({{80,45},{240,45},{80,135},{240,135}}) do
+        result[#result+1] = {
+            math.floor(offset_x + 320*anchor_x + (point[1]-320*anchor_x)*scale + 0.5),
+            math.floor(offset_y + 180*anchor_y + (point[2]-180*anchor_y)*scale + 0.5),
+        }
+    end
+    return result
+end
+local function check_zoom_pixels(zoom, label, scale, anchor_x, anchor_y, options)
+    options.samples = zoom_samples(scale,anchor_x,anchor_y,options.translate_x or 0,options.translate_y or 0)
+    local pixels=capture(zoom.name,label,nil,options)
+    local reference=capture(zoom_reference.name,label..'-reference',nil,
+        {samples={{80,45},{240,45},{80,135},{240,135}}})
+    for index=1,4 do
+        check(same_pixel(pixels[index],reference[index]),
+            label..' preserves source color, brightness, and alpha sample '..index)
+    end
+    check(zoom.data.alpha==1,label..' does not change opacity')
+    snapshots[label]=pixels
 end
 local function render()
     if done or not image then return end
@@ -317,6 +372,51 @@ local function render()
         end
         check(wd.alpha==1,'Wipe Out hidden endpoint does not use opacity')
         snapshots['wipe-end-hidden']=pixels
+    end
+    local zd=zoom_zero.data
+    if zd.owns and zd.active and zd.state=='STARTING' and zd.start_progress<0.05
+            and not snapshots['zoom-zero'] then
+        local pixels=capture(zoom_zero.name,'zoom-zero')
+        for index,pixel in ipairs(pixels) do
+            check(pixel[1]==0 and pixel[2]==0 and pixel[3]==0 and pixel[4]==0,
+                'Zero percent Zoom is transparent sample '..index)
+        end
+        check(zd.alpha==1,'Zero percent Zoom does not use opacity')
+        snapshots['zoom-zero']=pixels
+    end
+    local zs=zoom_shrink.data
+    if zs.owns and zs.active and zs.state=='STARTING' and near(zs.start_progress,0.5,0.05)
+            and not snapshots['zoom-shrink-in-half'] then
+        local scale=0.5+0.5*zs.start_progress
+        check_zoom_pixels(zoom_shrink,'zoom-shrink-in-half',scale,0.5,0.5,
+            {width=320,height=180})
+        local empty=capture(zoom_shrink.name,'zoom-shrink-in-empty',nil,
+            {samples={{5,5},{315,175}}})
+        for index,pixel in ipairs(empty) do
+            check(pixel[1]==0 and pixel[2]==0 and pixel[3]==0 and pixel[4]==0,
+                'Zoom In shrink leaves transparent space '..index)
+        end
+    elseif zs.owns and zs.active and zs.state=='ENDING' and near(zs.end_progress,0.5,0.05)
+            and not snapshots['zoom-shrink-out-half'] then
+        local scale=1-0.5*zs.end_progress
+        check_zoom_pixels(zoom_shrink,'zoom-shrink-out-half',scale,1,1,
+            {width=320,height=180})
+    end
+    local zg=zoom_grow.data
+    if zg.owns and zg.active and zg.state=='STARTING' and zg.start_progress<0.05
+            and not snapshots['zoom-grow-in'] then
+        local scale=2-zg.start_progress
+        check_zoom_pixels(zoom_grow,'zoom-grow-in',scale,1,0,
+            {width=700,height=400,translate_x=340,translate_y=20})
+        local expanded=zoom_samples(scale,1,0,340,20)
+        check(expanded[1][1]<340,'Above-100 Zoom In allocates visible pixels left of the original source area')
+    elseif zg.owns and zg.active and zg.state=='ENDING' and near(zg.end_progress,0.5,0.05)
+            and not snapshots['zoom-grow-out'] then
+        local scale=1+zg.end_progress
+        check_zoom_pixels(zoom_grow,'zoom-grow-out',scale,0.5,1,
+            {width=640,height=480,translate_x=200,translate_y=150})
+        local expanded=zoom_samples(scale,0.5,1,200,150)
+        check(expanded[1][2]<150,'Above-100 Zoom Out allocates visible pixels above the original source area')
     end
     local label
     if d.owns and d.active then
