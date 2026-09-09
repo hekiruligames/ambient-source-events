@@ -24,6 +24,12 @@ def main():
             data.extend(((255, 0, 0, 255) if x < 160 else (0, 255, 0, 128)) if y < 90
                         else ((0, 0, 255, 255) if x < 160 else (0, 0, 0, 0)))
     png(OUT / 'alpha.png', 320, 180, data)
+    softness = bytearray()
+    for y in range(180):
+        alpha = 255 if y < 60 else (128 if y < 120 else 0)
+        for _ in range(320):
+            softness.extend((240, 120, 60, alpha) if alpha else (0, 0, 0, 0))
+    png(OUT / 'softness.png', 320, 180, softness)
     ffmpeg = '/opt/homebrew/bin/ffmpeg'
     subprocess.run([ffmpeg, '-hide_banner', '-loglevel', 'error', '-y',
                     '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=30:duration=3',

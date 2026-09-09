@@ -35,7 +35,8 @@ local done, time, switches, pause_started, pause_position, pause_alpha = false, 
 local outcome, cleanup_frame, render_registered, cleanup_failed = nil, nil, false, false
 local snapshots, history = {}, {}
 local scene_a, scene_b, image, peek, peek_angle, wipe_horizontal, wipe_vertical
-local wipe_diagonal, wipe_angle, zoom_reference, zoom_shrink, zoom_grow, zoom_zero
+local wipe_diagonal, wipe_angle, soft_wipe, soft_reference
+local zoom_reference, zoom_shrink, zoom_grow, zoom_zero
 local easing_fade
 local white, media, gif_image, gif_media, text_source
 local original_load, original_unload, original_tick
@@ -201,6 +202,12 @@ local function setup()
         {first_display=1,interval=1,display_duration=2,start_effect=3,end_effect=3,
             start_duration=0.5,end_duration=0.5,start_direction=8,start_angle=30,
             end_direction=8,end_angle=210})
+    soft_wipe=make_source('image_source','ASE Soft Wipe PNG',{file=root..'softness.png'},
+        {first_display=1,interval=1,display_duration=2,start_effect=3,end_effect=3,
+            start_duration=0.5,end_duration=0.5,start_direction=2,end_direction=2,
+            start_softness=100,end_softness=100})
+    soft_reference=make_source('image_source','ASE Soft Wipe reference PNG',{file=root..'softness.png'},
+        {first_display=1,interval=1,display_duration=2,start_effect=0,end_effect=0})
     zoom_reference=make_source('image_source','ASE Zoom reference PNG',{file=root..'alpha.png'},
         {first_display=1,interval=1,display_duration=2,start_effect=0,end_effect=0})
     zoom_shrink=make_source('image_source','ASE Zoom shrink PNG',{file=root..'alpha.png'},
@@ -291,6 +298,9 @@ local function step(dt)
             check(obs.obs_source_get_width(wipe.filter)==320 and obs.obs_source_get_height(wipe.filter)==180,
                 'Wipe keeps the source output size: '..wipe.name)
         end
+        check(obs.obs_source_get_width(soft_wipe.filter)==320
+                and obs.obs_source_get_height(soft_wipe.filter)==180,
+            'Soft Wipe keeps the source output size')
         for _,zoom in ipairs({zoom_shrink,zoom_grow,zoom_zero}) do
             check(obs.obs_source_get_width(zoom.filter)==320 and obs.obs_source_get_height(zoom.filter)==180,
                 'Zoom keeps Scene Item source dimensions: '..zoom.name)
@@ -313,7 +323,9 @@ local function step(dt)
         check(obs.obs_source_media_get_state(media.parent)==obs.OBS_MEDIA_STATE_PLAYING,'Removal restores playback')
         for _,key in ipairs({'waiting','half','visible','ending','peek-start-outside','peek-end-outside',
                 'wipe-start-hidden','wipe-end-hidden','zoom-zero','zoom-shrink-in-half',
-                'zoom-shrink-out-half','zoom-grow-in','zoom-grow-out'}) do
+                'zoom-shrink-out-half','zoom-grow-in','zoom-grow-out',
+                'soft-wipe-in','soft-wipe-out','soft-wipe-in-near-end',
+                'soft-wipe-in-end','soft-wipe-out-near-end','soft-wipe-out-end'}) do
             check(snapshots[key]~=nil,'Captured GPU '..key)
         end
         write_result(true)
@@ -333,6 +345,55 @@ local function check_wipe_mask(pixels, visible, hidden, reference, label)
         check(pixels[index][1]==0 and pixels[index][2]==0 and pixels[index][3]==0
                 and pixels[index][4]==0, label..' hidden sample '..index)
     end
+end
+local function smoothstep(a,b,x)
+    local t=math.max(0,math.min(1,(x-a)/(b-a)))
+    return t*t*(3-2*t)
+end
+local function check_soft_wipe(phase,label,percent)
+    local d=soft_wipe.data
+    local progress=phase=='STARTING' and d.start_progress or d.end_progress
+    local softness=percent/100*180/320
+    local center_position=progress*(1+softness)-softness*0.5
+    local center=center_position*320
+    local full_x=math.max(0,math.floor(center-softness*160-12))
+    local hidden_x=math.min(319,math.ceil(center+softness*160+12))
+    if phase=='ENDING' then full_x,hidden_x=hidden_x,full_x end
+    local center_x=math.max(0,math.min(319,math.floor(center)))
+    local samples={{full_x,30},{center_x,30},{hidden_x,30},
+        {center_x,90},{center_x,150}}
+    local pixels=capture(soft_wipe.name,label,nil,{samples=samples})
+    local reference=capture(soft_reference.name,label..'-reference',nil,{samples=samples})
+    check(same_pixel(pixels[1],reference[1]),label..' fully visible side preserves source RGBA')
+    check(pixels[3][1]==0 and pixels[3][2]==0 and pixels[3][3]==0 and pixels[3][4]==0,
+        label..' fully hidden side is transparent')
+    local position=(center_x+0.5)/320
+    local edge0=center_position-softness*0.5
+    local edge1=center_position+softness*0.5
+    local mask=smoothstep(edge0,edge1,position)
+    if phase=='STARTING' then mask=1-mask end
+    check(mask>0.05 and mask<0.95,label..' samples a genuine gradient pixel')
+    for index=1,4 do
+        check(math.abs(pixels[2][index]-reference[2][index]*mask)<=7,
+            label..' premultiplied opaque channel '..index)
+        check(math.abs(pixels[4][index]-reference[4][index]*mask)<=7,
+            label..' premultiplied half-alpha channel '..index)
+    end
+    check(pixels[5][1]==0 and pixels[5][2]==0 and pixels[5][3]==0 and pixels[5][4]==0,
+        label..' original transparent pixel stays transparent in gradient')
+    local yellow=ffi.new('struct vec4',1,1,0,1)
+    local composite=capture(soft_wipe.name,label..'-yellow',yellow,
+        {samples={{center_x,30},{center_x,90}}})
+    for index,source_index in ipairs({2,4}) do
+        local source=reference[source_index]
+        local expected_alpha=source[4]/255*mask
+        local expected={source[1]*mask+255*(1-expected_alpha),
+            source[2]*mask+255*(1-expected_alpha),source[3]*mask,255}
+        for channel=1,4 do check(math.abs(composite[index][channel]-expected[channel])<=8,
+            label..' composites without darkening or color shift '..index..'/'..channel) end
+    end
+    check(d.alpha==1,label..' does not change global opacity')
+    snapshots[label]=pixels
 end
 local function zoom_samples(scale, anchor_x, anchor_y, offset_x, offset_y)
     local result = {}
@@ -435,6 +496,44 @@ local function render()
         end
         check(wd.alpha==1,'Wipe Out hidden endpoint does not use opacity')
         snapshots['wipe-end-hidden']=pixels
+    end
+    local sd=soft_wipe.data
+    if sd.owns and sd.active and sd.state=='STARTING'
+            and sd.start_progress>0.35 and sd.start_progress<0.65
+            and not snapshots['soft-wipe-in'] then
+        check_soft_wipe('STARTING','soft-wipe-in',sd.cfg.start_softness)
+    elseif sd.owns and sd.active and sd.state=='STARTING' and sd.start_progress>0.94
+            and not snapshots['soft-wipe-in-near-end'] then
+        snapshots['soft-wipe-in-near-end']=capture(soft_wipe.name,'soft-wipe-in-near-end',nil,
+            {samples={{319,30},{319,90},{319,150}}})
+    elseif sd.owns and sd.active and sd.state=='VISIBLE'
+            and snapshots['soft-wipe-in-near-end'] and not snapshots['soft-wipe-in-end'] then
+        local pixels=capture(soft_wipe.name,'soft-wipe-in-end',nil,
+            {samples={{319,30},{319,90},{319,150}}})
+        for index,pixel in ipairs(pixels) do
+            for channel=1,4 do check(math.abs(pixel[channel]
+                        - snapshots['soft-wipe-in-near-end'][index][channel])<=10,
+                    'Soft Wipe In approaches its endpoint without a final jump '..index..'/'..channel) end
+        end
+        snapshots['soft-wipe-in-end']=pixels
+    elseif sd.owns and sd.active and sd.state=='ENDING'
+            and sd.end_progress>0.35 and sd.end_progress<0.65
+            and not snapshots['soft-wipe-out'] then
+        check_soft_wipe('ENDING','soft-wipe-out',sd.cfg.end_softness)
+    elseif sd.owns and sd.active and sd.state=='ENDING' and sd.end_progress>0.94
+            and not snapshots['soft-wipe-out-near-end'] then
+        snapshots['soft-wipe-out-near-end']=capture(soft_wipe.name,'soft-wipe-out-near-end',nil,
+            {samples={{319,30},{319,90},{319,150}}})
+    elseif sd.owns and sd.active and sd.state=='WAITING'
+            and snapshots['soft-wipe-out-near-end'] and not snapshots['soft-wipe-out-end'] then
+        local pixels=capture(soft_wipe.name,'soft-wipe-out-end',nil,
+            {samples={{319,30},{319,90},{319,150}}})
+        for index,pixel in ipairs(pixels) do
+            for channel=1,4 do check(math.abs(pixel[channel]
+                        - snapshots['soft-wipe-out-near-end'][index][channel])<=10,
+                    'Soft Wipe Out approaches its endpoint without a final jump '..index..'/'..channel) end
+        end
+        snapshots['soft-wipe-out-end']=pixels
     end
     local zd=zoom_zero.data
     if zd.owns and zd.active and zd.state=='STARTING' and zd.start_progress<0.05

@@ -1,4 +1,4 @@
--- Ambient Source Events 0.5.0 / OBS Studio 32.0.4
+-- Ambient Source Events 0.6.1 / OBS Studio 32.0.4
 -- Source timing belongs to video_tick; video_render never advances time.
 local obs = obslua
 local bit = require('bit')
@@ -22,6 +22,7 @@ uniform float wipe_x;
 uniform float wipe_y;
 uniform float wipe_progress;
 uniform float wipe_mode;
+uniform float wipe_softness;
 uniform float zoom_visible;
 sampler_state textureSampler { Filter = Linear; AddressU = Clamp; AddressV = Clamp; };
 struct VertData { float4 pos : POSITION; float2 uv : TEXCOORD0; };
@@ -38,9 +39,16 @@ float4 PSOpacity(VertData v) : TARGET {
         float span = abs(wipe_x) + abs(wipe_y);
         float minimum = min(0.0, wipe_x) + min(0.0, wipe_y);
         float position = (dot(v.uv, float2(wipe_x, wipe_y)) - minimum) / span;
-        if ((wipe_mode < 1.5 && position > wipe_progress) ||
-                (wipe_mode > 1.5 && position <= wipe_progress))
-            return float4(0.0, 0.0, 0.0, 0.0);
+        if (wipe_softness <= 0.0) {
+            if ((wipe_mode < 1.5 && position > wipe_progress) ||
+                    (wipe_mode > 1.5 && position <= wipe_progress))
+                return float4(0.0, 0.0, 0.0, 0.0);
+        } else {
+            float gradient = smoothstep(wipe_progress - wipe_softness * 0.5,
+                wipe_progress + wipe_softness * 0.5, position);
+            float mask = wipe_mode < 1.5 ? 1.0 - gradient : gradient;
+            return image.Sample(textureSampler, sample_uv) * (opacity * mask);
+        }
     }
     return image.Sample(textureSampler, sample_uv) * opacity;
 }
@@ -89,6 +97,11 @@ local function zoom_scale(settings, key)
     if not finite(percent) then percent = 50 end
     return clamp(percent, 0, ZOOM_UI_MAX) / 100
 end
+local function softness(settings, key)
+    local percent = obs.obs_data_get_double(settings, key)
+    if not finite(percent) then percent = 0 end
+    return clamp(percent, 0, 100)
+end
 local function config(settings)
     local lo = number(settings, 'random_min', 20)
     local hi = number(settings, 'random_max', 60)
@@ -112,6 +125,8 @@ local function config(settings)
         end_direction = direction(settings, 'end_direction'),
         start_angle = angle(settings, 'start_angle'),
         end_angle = angle(settings, 'end_angle'),
+        start_softness = softness(settings, 'start_softness'),
+        end_softness = softness(settings, 'end_softness'),
         start_zoom_anchor = zoom_anchor(settings, 'start_zoom_anchor'),
         end_zoom_anchor = zoom_anchor(settings, 'end_zoom_anchor'),
         start_zoom_scale = zoom_scale(settings, 'start_zoom_percent'),
@@ -180,6 +195,22 @@ local function effect_direction(d, effect_type)
     local custom_angle = d.state == 'STARTING' and cfg.start_angle or cfg.end_angle
     local ux, uy = direction_unit(direction_index, custom_angle)
     return ux, uy, progress, mode
+end
+local function wipe_parameters(d, width, height)
+    local ux, uy, progress, mode = effect_direction(d, WIPE)
+    if mode == 0 or width <= 0 or height <= 0 then return ux, uy, progress, mode, 0 end
+    local percent = d.state == 'STARTING' and d.cfg.start_softness or d.cfg.end_softness
+    if percent <= 0 then return ux, uy, progress, mode, 0 end
+    local span = math.abs(ux) + math.abs(uy)
+    local units_per_pixel = math.sqrt((ux / width) ^ 2 + (uy / height) ^ 2)
+    -- Convert the source-height-based pixel width into the shader's existing
+    -- normalized boundary coordinate without changing Wipe direction/progress.
+    local normalized = (percent / 100) * height * units_per_pixel / span
+    -- The centered gradient extends by half its width on each side. Move its
+    -- center fully outside both edges so the complete gradient crosses within
+    -- the effect duration, without endpoint-only overrides in the shader.
+    local center = progress * (1 + normalized) - normalized * 0.5
+    return ux, uy, center, mode, normalized
 end
 local function log(d, message)
     if d.notice == message then return end
@@ -544,7 +575,8 @@ info.get_name = function() return TITLE end
 info.get_defaults = function(s)
     for k, v in pairs({interval = 30, random_min = 20, random_max = 60,
         display_duration = 5, start_duration = 0.5, end_duration = 0.5,
-        start_zoom_percent = 50, end_zoom_percent = 50}) do
+        start_zoom_percent = 50, end_zoom_percent = 50,
+        start_softness = 0, end_softness = 0}) do
         obs.obs_data_set_default_double(s, k, v)
     end
     for k, v in pairs({interval_mode = 0, first_display = 0, duration_mode = 0,
@@ -574,6 +606,7 @@ info.create = function(settings, source)
         d.wipe_y_param = obs.gs_effect_get_param_by_name(d.effect, 'wipe_y')
         d.wipe_progress_param = obs.gs_effect_get_param_by_name(d.effect, 'wipe_progress')
         d.wipe_mode_param = obs.gs_effect_get_param_by_name(d.effect, 'wipe_mode')
+        d.wipe_softness_param = obs.gs_effect_get_param_by_name(d.effect, 'wipe_softness')
         d.zoom_visible_param = obs.gs_effect_get_param_by_name(d.effect, 'zoom_visible')
     end
     obs.obs_leave_graphics()
@@ -631,7 +664,8 @@ info.video_render = function(d)
         local width = target and obs.obs_source_get_base_width(target) or 0
         local height = target and obs.obs_source_get_base_height(target) or 0
         local offset_x, offset_y = peek_offset(d, width, height)
-        local wipe_x, wipe_y, wipe_progress, wipe_mode = effect_direction(d, WIPE)
+        local wipe_x, wipe_y, wipe_progress, wipe_mode, wipe_softness =
+            wipe_parameters(d, width, height)
         local scale, translate_x, translate_y = zoom_transform(d, width, height)
         obs.gs_effect_set_float(d.opacity_param, clamp(alpha, 0, 1))
         obs.gs_effect_set_float(d.offset_x_param, offset_x)
@@ -640,6 +674,7 @@ info.video_render = function(d)
         obs.gs_effect_set_float(d.wipe_y_param, wipe_y)
         obs.gs_effect_set_float(d.wipe_progress_param, wipe_progress)
         obs.gs_effect_set_float(d.wipe_mode_param, wipe_mode)
+        obs.gs_effect_set_float(d.wipe_softness_param, wipe_softness)
         obs.gs_effect_set_float(d.zoom_visible_param, scale > 0 and 1 or 0)
         obs.gs_blend_state_push()
         obs.gs_blend_function(obs.GS_BLEND_ONE, obs.GS_BLEND_INVSRCALPHA)
@@ -707,12 +742,14 @@ local function layout(props, _, settings)
     for _, prefix in ipairs({'start', 'end'}) do
         local selected = obs.obs_data_get_int(settings, prefix .. '_effect')
         local directional = selected == PEEK or selected == WIPE
+        local wipe = selected == WIPE
         local zoom = selected == ZOOM
         obs.obs_property_set_visible(obs.obs_properties_get(props, prefix .. '_duration'), selected ~= NONE)
         obs.obs_property_set_visible(obs.obs_properties_get(props, prefix .. '_easing'), selected ~= NONE)
         obs.obs_property_set_visible(obs.obs_properties_get(props, prefix .. '_direction'), directional)
         obs.obs_property_set_visible(obs.obs_properties_get(props, prefix .. '_angle'), directional
             and obs.obs_data_get_int(settings, prefix .. '_direction') == 8)
+        obs.obs_property_set_visible(obs.obs_properties_get(props, prefix .. '_softness'), wipe)
         obs.obs_property_set_visible(obs.obs_properties_get(props, prefix .. '_zoom_anchor'), zoom)
         obs.obs_property_set_visible(obs.obs_properties_get(props, prefix .. '_zoom_percent'), zoom)
     end
@@ -754,6 +791,9 @@ info.get_properties = function(d)
         local angle_property = obs.obs_properties_add_int(group, entry[1] .. '_angle',
             '角度', 0, 359, 1)
         obs.obs_property_int_set_suffix(angle_property, '°')
+        local softness_property = obs.obs_properties_add_float(group,
+            entry[1] .. '_softness', 'Softness', 0, 100, 1)
+        obs.obs_property_float_set_suffix(softness_property, ' %')
         local zoom_anchor_property = obs.obs_properties_add_list(group,
             entry[1] .. '_zoom_anchor', 'ズーム基準点',
             obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_INT)

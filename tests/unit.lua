@@ -20,7 +20,8 @@ local function test()
     replace('obs_enter_graphics', function() end)
     replace('obs_leave_graphics', function() end)
     local rendered_alpha, rendered_offset_x, rendered_offset_y, rendered_wipe_x, rendered_wipe_y
-    local rendered_wipe_progress, rendered_wipe_mode, rendered_zoom_visible, bypassed
+    local rendered_wipe_progress, rendered_wipe_mode, rendered_wipe_softness
+    local rendered_zoom_visible, bypassed
     local rendered_translate_x, rendered_translate_y, rendered_scale_x, rendered_scale_y
     local matrix_depth = 0
     replace('obs_source_skip_video_filter', function() bypassed = true end)
@@ -34,6 +35,7 @@ local function test()
         elseif param == 'wipe_y' then rendered_wipe_y = value
         elseif param == 'wipe_progress' then rendered_wipe_progress = value
         elseif param == 'wipe_mode' then rendered_wipe_mode = value
+        elseif param == 'wipe_softness' then rendered_wipe_softness = value
         elseif param == 'zoom_visible' then rendered_zoom_visible = value end
     end)
     replace('gs_blend_state_push', function() end)
@@ -233,7 +235,8 @@ local function test()
         d.cfg.start_direction = direction_index - 1
         source.video_render(d)
         check(near(rendered_wipe_x, expected[1]) and near(rendered_wipe_y, expected[2])
-                and rendered_wipe_progress == 0 and rendered_wipe_mode == 1,
+                and rendered_wipe_progress == 0 and rendered_wipe_mode == 1
+                and rendered_wipe_softness == 0,
             'Wipe In boundary direction ' .. (direction_index - 1))
     end
     d.cfg.start_direction, d.cfg.start_angle = 8, 30
@@ -255,6 +258,116 @@ local function test()
         'Wipe Out uses its independent default left direction')
     tick(d, p, 0.25)
     check(d.state == 'WAITING' and p.muted, 'Wipe Out finishes fully hidden')
+    destroy(d, p, f)
+
+    d, p, f = make({display_duration = 2, start_effect = 3, start_duration = 0.5,
+        start_softness = 5, end_effect = 3, end_duration = 0.5,
+        end_softness = 25, start_direction = 2, end_direction = 2}, false)
+    p.width, p.height = 1920, 1080
+    check(d.cfg.start_softness == 5 and d.cfg.end_softness == 25,
+        'Wipe start and end Softness settings are independent')
+    local softness_cases = {
+        {5, 2, 0}, {10, 4, 0}, {25, 3, 0}, {100, 8, 30},
+    }
+    for _, case in ipairs(softness_cases) do
+        d.cfg.start_softness, d.cfg.start_direction, d.cfg.start_angle = case[1], case[2], case[3]
+        source.video_render(d)
+        local span = math.abs(rendered_wipe_x) + math.abs(rendered_wipe_y)
+        local units_per_pixel = math.sqrt((rendered_wipe_x / p.width) ^ 2
+            + (rendered_wipe_y / p.height) ^ 2)
+        local pixel_width = rendered_wipe_softness * span / units_per_pixel
+        check(near(pixel_width, case[1] / 100 * p.height, 1e-6),
+            case[1] .. ' percent Softness uses source height for direction ' .. case[2])
+    end
+    d.cfg.start_softness, d.cfg.start_direction = 10, 2
+    p.width = 3840
+    source.video_render(d)
+    check(near(rendered_wipe_softness * p.width, 108),
+        'Horizontal Softness remains 108 pixels when only source width changes')
+    p.width = 1920
+    d.cfg.start_softness, d.cfg.start_direction = 5, 2
+    source.video_render(d)
+    check(near(rendered_wipe_softness * p.width, 54),
+        'Five percent Softness on 1080-high source is 54 pixels')
+    local function test_easing(t, mode)
+        if mode == 0 then return t end
+        if mode == 1 then return t * t * t end
+        if mode == 2 then return 1 - (1 - t) ^ 3 end
+        return t < 0.5 and 4 * t * t * t or 1 - ((-2 * t + 2) ^ 3) / 2
+    end
+    local function smoothstep(a, b, x)
+        local t = math.max(0, math.min(1, (x - a) / (b - a)))
+        return t * t * (3 - 2 * t)
+    end
+    local function soft_mask(position, center, width, wipe_mode)
+        local gradient = smoothstep(center - width * 0.5, center + width * 0.5, position)
+        return wipe_mode == 1 and 1 - gradient or gradient
+    end
+    local endpoint_times = {0, 1e-6, 0.5, 1 - 1e-6, 1}
+    for _, percent in ipairs({0, 15, 50, 100}) do
+        local width = percent / 100 * p.height / p.width
+        for easing_mode = 0, 3 do
+            for wipe_mode = 1, 2 do
+                d.state = wipe_mode == 1 and 'STARTING' or 'ENDING'
+                d.cfg.start_direction, d.cfg.end_direction = 2, 2
+                d.cfg.start_softness, d.cfg.end_softness = percent, percent
+                local masks = {}
+                local midpoint_mask
+                for time_index, raw in ipairs(endpoint_times) do
+                    local eased = test_easing(raw, easing_mode)
+                    if wipe_mode == 1 then d.start_progress = eased else d.end_progress = eased end
+                    source.video_render(d)
+                    local expected_center = percent == 0 and eased
+                        or eased * (1 + width) - width * 0.5
+                    check(near(rendered_wipe_progress, expected_center, 1e-12),
+                        percent .. '% mode ' .. wipe_mode .. ' easing ' .. easing_mode
+                            .. ' boundary center at sample ' .. time_index)
+                    if percent > 0 then
+                        masks[time_index] = {}
+                        for position_index, position in ipairs({0, 0.25, 0.5, 0.75, 1}) do
+                            masks[time_index][position_index] =
+                                soft_mask(position, rendered_wipe_progress,
+                                    rendered_wipe_softness, wipe_mode)
+                        end
+                        if time_index == 3 then
+                            midpoint_mask = soft_mask(rendered_wipe_progress,
+                                rendered_wipe_progress, rendered_wipe_softness, wipe_mode)
+                        end
+                    else
+                        check(rendered_wipe_softness == 0 and near(rendered_wipe_progress, eased),
+                            'Zero Softness preserves hard Wipe progress exactly')
+                    end
+                end
+                if percent > 0 then
+                    local at_start, at_end = wipe_mode == 1 and 0 or 1, wipe_mode == 1 and 1 or 0
+                    for position_index = 1, 5 do
+                        check(near(masks[1][position_index], at_start, 1e-12)
+                                and near(masks[5][position_index], at_end, 1e-12),
+                            percent .. '% mode ' .. wipe_mode .. ' easing ' .. easing_mode
+                                .. ' reaches exact endpoints at position ' .. position_index)
+                        check(math.abs(masks[2][position_index] - masks[1][position_index]) < 1e-4
+                                and math.abs(masks[5][position_index] - masks[4][position_index]) < 1e-4,
+                            percent .. '% mode ' .. wipe_mode .. ' easing ' .. easing_mode
+                                .. ' remains continuous near endpoints at position ' .. position_index)
+                    end
+                    check(near(midpoint_mask, 0.5, 1e-12),
+                        percent .. '% mode ' .. wipe_mode .. ' easing ' .. easing_mode
+                            .. ' keeps the centered midpoint gradient')
+                end
+            end
+        end
+    end
+    d.state, d.start_progress, d.end_progress = 'STARTING', 0, 0
+    d.cfg.start_softness, d.cfg.end_softness = 5, 25
+    tick(d, p, 1.75); source.video_render(d)
+    check(d.state == 'ENDING' and near(rendered_wipe_softness * p.width, 270),
+        'Wipe Out uses its independent 25 percent Softness')
+    destroy(d, p, f)
+
+    d, p, f = make({display_duration = 2, start_effect = 3, start_softness = -5,
+        end_effect = 3, end_softness = 125}, false)
+    check(d.cfg.start_softness == 0 and d.cfg.end_softness == 100,
+        'Stored Softness values clamp to zero through 100 percent')
     destroy(d, p, f)
 
     d, p, f = make({display_duration = 2, start_effect = 4, start_duration = 0.5,
@@ -349,7 +462,7 @@ local function test()
     local function reset_rendered()
         rendered_alpha, rendered_offset_x, rendered_offset_y = nil, nil, nil
         rendered_wipe_x, rendered_wipe_y = nil, nil
-        rendered_wipe_progress, rendered_wipe_mode = nil, nil
+        rendered_wipe_progress, rendered_wipe_mode, rendered_wipe_softness = nil, nil, nil
         rendered_zoom_visible = nil
         rendered_translate_x, rendered_translate_y = nil, nil
         rendered_scale_x, rendered_scale_y = nil, nil
@@ -373,6 +486,7 @@ local function test()
             check(rendered_alpha == 1 and rendered_offset_x == 0 and rendered_offset_y == 0
                     and near(rendered_wipe_progress, progress)
                     and rendered_wipe_mode == (starting and 1 or 2)
+                    and rendered_wipe_softness == 0
                     and rendered_scale_x == 1 and rendered_scale_y == 1,
                 label .. ' changes only Wipe boundary')
         else
@@ -418,8 +532,9 @@ local function test()
     obs.obs_data_set_int(legacy_settings, 'start_effect', 1)
     obs.obs_data_set_int(legacy_settings, 'end_effect', 4)
     source.update(d, legacy_settings)
-    check(d.pending_cfg.start_easing == 0 and d.pending_cfg.end_easing == 0,
-        'Stored settings without easing values use Linear')
+    check(d.pending_cfg.start_easing == 0 and d.pending_cfg.end_easing == 0
+            and d.pending_cfg.start_softness == 0 and d.pending_cfg.end_softness == 0,
+        'Stored settings without easing or Softness values use Linear and hard Wipe')
     obs.obs_data_release(legacy_settings)
     destroy(d, p, f)
 
@@ -505,7 +620,8 @@ local function test()
     local settings = obs.obs_data_create(); source.get_defaults(settings)
     local props = source.get_properties(nil)
     for _, key in ipairs({'interval', 'random_min', 'random_max', 'display_duration', 'start_duration',
-            'end_duration', 'start_zoom_percent', 'end_zoom_percent'}) do
+            'end_duration', 'start_zoom_percent', 'end_zoom_percent',
+            'start_softness', 'end_softness'}) do
         local property = obs.obs_properties_get(props, key)
         check(property ~= nil, 'Numeric property exists: ' .. key)
         check(not obs.obs_property_modified(property, settings), 'Numbers do not rebuild properties: ' .. key)
@@ -516,6 +632,9 @@ local function test()
     check(obs.obs_property_visible(obs.obs_properties_get(props, 'random_min')), 'Random field shown')
     check(not obs.obs_property_visible(obs.obs_properties_get(props, 'start_direction')),
         'Peek direction hidden for Fade')
+    check(not obs.obs_property_visible(obs.obs_properties_get(props, 'start_softness'))
+            and not obs.obs_property_visible(obs.obs_properties_get(props, 'end_softness')),
+        'Fade hides start and end Softness controls')
     local easing_items = {
         '一定', 'ゆっくり始まる', 'ゆっくり終わる',
         'ゆっくり始まり、ゆっくり終わる',
@@ -531,26 +650,43 @@ local function test()
         end
     end
     check(obs.obs_data_get_int(settings, 'start_easing') == 0
-            and obs.obs_data_get_int(settings, 'end_easing') == 0,
-        'Start and end easing default to Linear')
+            and obs.obs_data_get_int(settings, 'end_easing') == 0
+            and obs.obs_data_get_double(settings, 'start_softness') == 0
+            and obs.obs_data_get_double(settings, 'end_softness') == 0,
+        'Easing defaults to Linear and start/end Softness default to zero')
     obs.obs_data_set_int(settings, 'start_effect', 0)
     obs.obs_data_set_int(settings, 'end_effect', 0)
     check(obs.obs_property_modified(obs.obs_properties_get(props, 'start_effect'), settings)
             and obs.obs_property_modified(obs.obs_properties_get(props, 'end_effect'), settings)
             and not obs.obs_property_visible(obs.obs_properties_get(props, 'start_easing'))
-            and not obs.obs_property_visible(obs.obs_properties_get(props, 'end_easing')),
-        'No effect hides start and end easing controls')
+            and not obs.obs_property_visible(obs.obs_properties_get(props, 'end_easing'))
+            and not obs.obs_property_visible(obs.obs_properties_get(props, 'start_softness'))
+            and not obs.obs_property_visible(obs.obs_properties_get(props, 'end_softness')),
+        'No effect hides start/end easing and Softness controls')
     obs.obs_data_set_int(settings, 'start_effect', 2)
     check(obs.obs_property_modified(obs.obs_properties_get(props, 'start_effect'), settings),
         'Peek selection updates visibility')
     check(obs.obs_property_visible(obs.obs_properties_get(props, 'start_easing'))
             and obs.obs_property_visible(obs.obs_properties_get(props, 'start_direction'))
-            and not obs.obs_property_visible(obs.obs_properties_get(props, 'start_angle')),
-        'Peek shows easing and direction but hides non-custom angle')
+            and not obs.obs_property_visible(obs.obs_properties_get(props, 'start_angle'))
+            and not obs.obs_property_visible(obs.obs_properties_get(props, 'start_softness')),
+        'Peek shows easing and direction but hides non-custom angle and Softness')
     obs.obs_data_set_int(settings, 'start_effect', 3)
     check(obs.obs_property_modified(obs.obs_properties_get(props, 'start_effect'), settings)
-            and obs.obs_property_visible(obs.obs_properties_get(props, 'start_direction')),
-        'Wipe selection reuses directional controls')
+            and obs.obs_property_visible(obs.obs_properties_get(props, 'start_direction'))
+            and obs.obs_property_visible(obs.obs_properties_get(props, 'start_softness')),
+        'Wipe selection shows directional and Softness controls')
+    for _, prefix in ipairs({'start', 'end'}) do
+        local property = obs.obs_properties_get(props, prefix .. '_softness')
+        check(property ~= nil and obs.obs_property_float_min(property) == 0
+                and obs.obs_property_float_max(property) == 100
+                and obs.obs_property_float_step(property) == 1,
+            prefix .. ' Softness is zero through 100 percent in one-percent steps')
+    end
+    obs.obs_data_set_int(settings, 'end_effect', 3)
+    check(obs.obs_property_modified(obs.obs_properties_get(props, 'end_effect'), settings)
+            and obs.obs_property_visible(obs.obs_properties_get(props, 'end_softness')),
+        'Wipe Out independently shows its Softness control')
     obs.obs_data_set_int(settings, 'start_direction', 8)
     check(obs.obs_property_modified(obs.obs_properties_get(props, 'start_direction'), settings)
             and obs.obs_property_visible(obs.obs_properties_get(props, 'start_angle')),
@@ -560,8 +696,9 @@ local function test()
             and obs.obs_property_visible(obs.obs_properties_get(props, 'start_zoom_anchor'))
             and obs.obs_property_visible(obs.obs_properties_get(props, 'start_zoom_percent'))
             and not obs.obs_property_visible(obs.obs_properties_get(props, 'start_direction'))
-            and not obs.obs_property_visible(obs.obs_properties_get(props, 'start_angle')),
-        'Zoom selection shows only anchor, percent, and duration controls')
+            and not obs.obs_property_visible(obs.obs_properties_get(props, 'start_angle'))
+            and not obs.obs_property_visible(obs.obs_properties_get(props, 'start_softness')),
+        'Zoom selection hides Wipe direction, angle, and Softness controls')
     check(obs.obs_data_get_double(settings, 'start_zoom_percent') == 50
             and obs.obs_data_get_double(settings, 'end_zoom_percent') == 50
             and obs.obs_data_get_int(settings, 'start_zoom_anchor') == 4
