@@ -1,0 +1,368 @@
+-- Real OBS LuaJIT/data/properties, with an explicitly simulated source/decoder.
+local obs = obslua
+local count = 0
+local function check(ok, message) assert(ok, message); count = count + 1 end
+local function near(a, b, tolerance) return math.abs(a - b) <= (tolerance or 1e-7) end
+local function test()
+    local definition
+    obs.obs_register_source = function(d) definition = d end
+    obs.obs_frontend_add_event_callback = function() end
+    obs.obs_frontend_remove_event_callback = function() end
+    dofile('ambient-source-events.lua')
+    script_load()
+    script_load = nil
+    local source = definition
+    local real = {}
+    local function replace(name, fn) real[name] = obs[name]; obs[name] = fn end
+    replace('gs_effect_create', function() return {} end)
+    replace('gs_effect_get_param_by_name', function(_, name) return name end)
+    replace('gs_effect_destroy', function() end)
+    replace('obs_enter_graphics', function() end)
+    replace('obs_leave_graphics', function() end)
+    local rendered_alpha, rendered_offset_x, rendered_offset_y, rendered_wipe_x, rendered_wipe_y
+    local rendered_wipe_progress, rendered_wipe_mode, bypassed
+    replace('obs_source_skip_video_filter', function() bypassed = true end)
+    replace('obs_source_process_filter_begin', function() return true end)
+    replace('obs_source_process_filter_end', function() end)
+    replace('gs_effect_set_float', function(param, value)
+        if param == 'opacity' then rendered_alpha = value
+        elseif param == 'offset_x' then rendered_offset_x = value
+        elseif param == 'offset_y' then rendered_offset_y = value
+        elseif param == 'wipe_x' then rendered_wipe_x = value
+        elseif param == 'wipe_y' then rendered_wipe_y = value
+        elseif param == 'wipe_progress' then rendered_wipe_progress = value
+        elseif param == 'wipe_mode' then rendered_wipe_mode = value end
+    end)
+    replace('gs_blend_state_push', function() end)
+    replace('gs_blend_function', function() end)
+    replace('gs_blend_state_pop', function() end)
+    replace('obs_source_get_signal_handler', function(p) return p.signals end)
+    replace('signal_handler_connect', function(h, signal, callback)
+        h[signal] = h[signal] or {}; h[signal][callback] = true
+    end)
+    replace('signal_handler_disconnect', function(h, signal, callback)
+        if h[signal] then h[signal][callback] = nil end
+    end)
+    replace('obs_source_get_uuid', function(p) return p.uuid end)
+    replace('obs_source_get_weak_source', function(p) p.weak = (p.weak or 0) + 1; return {p = p} end)
+    replace('obs_weak_source_release', function(w) w.p.weak = w.p.weak - 1 end)
+    replace('obs_weak_source_get_source', function(w) return w.p.alive and w.p or nil end)
+    replace('obs_source_release', function() end)
+    replace('obs_source_get_ref', function(p) return p end)
+    replace('obs_source_get_settings', function(p) obs.obs_data_addref(p.settings); return p.settings end)
+    replace('obs_source_get_unversioned_id', function(p) return p.kind end)
+    replace('obs_source_get_output_flags', function(p) return p.audio and obs.OBS_SOURCE_AUDIO or obs.OBS_SOURCE_VIDEO end)
+    replace('obs_filter_get_parent', function(f) return f.parent end)
+    replace('obs_filter_get_target', function(f) return f.parent end)
+    replace('obs_source_get_base_width', function(p) return p.width or 320 end)
+    replace('obs_source_get_base_height', function(p) return p.height or 180 end)
+    replace('obs_source_active', function(p) return p.active end)
+    replace('obs_source_showing', function(p) return p.showing end)
+    replace('obs_source_enabled', function(f) return f.enabled end)
+    replace('obs_source_muted', function(p) return p.muted end)
+    replace('obs_source_set_muted', function(p, m) p.muted = m end)
+    replace('obs_source_update_properties', function() end)
+    replace('obs_source_media_get_time', function(p) return p.position end)
+    replace('obs_source_media_get_duration', function(p) return p.duration end)
+    replace('obs_source_media_get_state', function(p) return p.media_state end)
+    replace('obs_source_media_stop', function(p) table.insert(p.commands, 'stop') end)
+    replace('obs_source_media_restart', function(p) table.insert(p.commands, 'restart') end)
+    replace('obs_source_media_play_pause', function(p, pause) table.insert(p.commands, pause and 'pause' or 'play') end)
+    replace('calldata_bool', function(cd, key) return cd[key] end)
+    replace('calldata_source', function(cd, key) return cd[key] end)
+    local uid = 0
+    local function emit(p, signal, cd)
+        for cb in pairs(p.signals[signal] or {}) do cb(cd or {}) end
+    end
+    local function make(options, media, muted, shared, before_tick)
+        uid = uid + 1
+        local settings = obs.obs_data_create()
+        source.get_defaults(settings)
+        for k, v in pairs(options or {}) do
+            if k:find('effect') or k:find('mode') or k:find('direction')
+                    or k:find('angle') or k == 'first_display' then
+                obs.obs_data_set_int(settings, k, v)
+            else obs.obs_data_set_double(settings, k, v) end
+        end
+        local p = shared
+        if not p then
+            p = {uuid = 'parent' .. uid, kind = media and 'ffmpeg_source' or 'image_source',
+                audio = true, active = true, showing = true, muted = muted or false, alive = true,
+                media_state = obs.OBS_MEDIA_STATE_ENDED, position = 3000, duration = 3000,
+                settings = obs.obs_data_create(), commands = {}, signals = {}}
+            obs.obs_data_set_bool(p.settings, 'is_local_file', true)
+            obs.obs_data_set_int(p.settings, 'speed_percent', 100)
+        end
+        local f = {uuid = 'filter' .. uid, settings = settings, parent = p, enabled = true, signals = {}}
+        local d = source.create(settings, f)
+        if before_tick then before_tick(d, p, f) end
+        source.video_tick(d, 0)
+        return d, p, f
+    end
+    local function tick(d, p, dt, advance)
+        for _, cmd in ipairs(p.commands) do
+            if cmd == 'stop' then p.media_state, p.position = obs.OBS_MEDIA_STATE_STOPPED, 0
+            elseif cmd == 'restart' then
+                p.media_state, p.position = obs.OBS_MEDIA_STATE_PLAYING, 0
+                p.restarts = (p.restarts or 0) + 1
+                emit(p, 'media_restart'); emit(p, 'media_started')
+            elseif cmd == 'pause' then p.media_state = obs.OBS_MEDIA_STATE_PAUSED
+            elseif cmd == 'play' and p.media_state == obs.OBS_MEDIA_STATE_PAUSED then p.media_state = obs.OBS_MEDIA_STATE_PLAYING end
+        end
+        p.commands = {}
+        if advance ~= false and p.media_state == obs.OBS_MEDIA_STATE_PLAYING then
+            p.position = p.position + dt * 1000 * (obs.obs_data_get_int(p.settings, 'speed_percent') / 100)
+            if p.position >= 3000 then p.media_state = obs.OBS_MEDIA_STATE_ENDED; emit(p, 'media_ended') end
+        end
+        source.video_tick(d, dt)
+        script_tick()
+    end
+    local function destroy(d, p, f, keep_parent)
+        source.destroy(d)
+        check(d.effect == nil, 'Shader resource released')
+        for i = 1, 3 do script_tick() end
+        check((p.weak or 0) == 0 or keep_parent, 'Weak references released')
+        obs.obs_data_release(f.settings)
+        if not keep_parent then obs.obs_data_release(p.settings) end
+    end
+    local d, p, f = make({first_display = 1, interval = 30}, false, false, nil, function(d)
+        bypassed, rendered_alpha = false, nil
+        source.video_render(d)
+        check(not bypassed and rendered_alpha == 0, 'Before first tick there is no unfiltered flash')
+        check(d.generation == 0 and d.wait_left == 0 and not d.owns, 'Rendering does not acquire or advance time')
+    end)
+    check(d.state == 'WAITING' and p.muted and d.alpha == 0, 'Initial wait and mute')
+    tick(d, p, 29.75); check(near(d.wait_left, 0.25), 'Fractional wait')
+    p.active = false; tick(d, p, 100); check(near(d.wait_left, 0.25), 'Inactive waiting frozen')
+    p.active = true; tick(d, p, 0.25); check(d.state == 'STARTING' and d.alpha == 0, 'Starts after wait')
+    tick(d, p, 0.25); check(near(d.alpha, 0.5) and not p.muted, 'Fade in halfway')
+    tick(d, p, 0.25); check(d.state == 'VISIBLE' and d.alpha == 1, 'Full visibility')
+    tick(d, p, 4.25); check(d.state == 'ENDING' and near(d.alpha, 0.5), 'Fade out halfway')
+    tick(d, p, 0.25); check(d.state == 'WAITING' and p.muted and near(d.wait_left, 30), 'Total includes fades')
+    f.enabled = false; source.video_tick(d, 0)
+    check(not p.muted and d.alpha == 1, 'Disable restores mute and opacity')
+    bypassed = false; source.video_render(d)
+    check(bypassed, 'Disabled filter passes original pixels')
+    f.enabled = true
+    bypassed, rendered_alpha = false, nil; source.video_render(d)
+    check(not bypassed and rendered_alpha == 0, 'Re-enable before next tick does not flash')
+    source.video_tick(d, 0)
+    check(d.state == 'WAITING' and near(d.wait_left, 30), 'Re-enable resets initial policy')
+    destroy(d, p, f)
+
+    d, p, f = make({duration_mode = 1, display_duration = 5}, false)
+    tick(d, p, 5.5); check(d.state == 'ENDING' and near(d.alpha, 1), 'Excluded fade total is six')
+    tick(d, p, 0.5); check(d.state == 'WAITING', 'Excluded fade ends at six')
+    destroy(d, p, f)
+    d, p, f = make({display_duration = 1, start_duration = 4, end_duration = 2}, false)
+    tick(d, p, 1/3); check(near(d.alpha, 0.5), 'Oversized fades scale proportionally')
+    tick(d, p, 1/3); check(near(d.alpha, 1), 'Oversized fades meet without negative hold')
+    tick(d, p, 1/3); check(d.state == 'WAITING', 'Oversized fades preserve total')
+    destroy(d, p, f)
+    d, p, f = make({interval = 0, display_duration = 0.01, start_effect = 0, end_effect = 0}, false, true)
+    check(d.alpha == 1 and p.muted, 'Originally muted remains muted when visible')
+    for i = 1, 300 do tick(d, p, 1/60); check(d.alpha == 0 or d.alpha == 1, 'Zero intervals bounded') end
+    destroy(d, p, f)
+    d, p, f = make({display_duration = 2, start_effect = 0, end_effect = 1, end_duration = 0.5}, false)
+    check(d.alpha == 1 and d.state == 'VISIBLE', 'No start effect shows immediately')
+    tick(d, p, 1.75); check(near(d.alpha, 0.5) and d.state == 'ENDING', 'End fade works independently')
+    tick(d, p, 0.25); check(d.alpha == 0 and p.muted, 'End-only fade finishes hidden and muted')
+    destroy(d, p, f)
+    d, p, f = make({display_duration = 2, start_effect = 1, start_duration = 0.5, end_effect = 0}, false)
+    tick(d, p, 0.25); check(near(d.alpha, 0.5), 'Start fade works without end fade')
+    tick(d, p, 1.74); check(d.alpha == 1, 'No end effect keeps full alpha until duration')
+    tick(d, p, 0.01); check(d.alpha == 0 and p.muted, 'No end effect still hides at the boundary')
+    destroy(d, p, f)
+
+    d, p, f = make({display_duration = 2, start_effect = 2, start_duration = 0.5,
+        end_effect = 2, end_duration = 0.5}, false)
+    check(d.state == 'STARTING' and d.alpha == 1 and d.start_progress == 0 and p.muted,
+        'Peek starts fully outside without changing opacity')
+    local start_offsets = {
+        {0, 1}, {-0.5625, 1}, {-1, 0}, {-0.5625, -1},
+        {0, -1}, {0.5625, -1}, {1, 0}, {0.5625, 1},
+    }
+    for direction_index, expected in ipairs(start_offsets) do
+        d.cfg.start_direction = direction_index - 1
+        rendered_offset_x, rendered_offset_y = nil, nil
+        source.video_render(d)
+        check(near(rendered_offset_x, expected[1]) and near(rendered_offset_y, expected[2]),
+            'Peek In direction offset ' .. (direction_index - 1))
+    end
+    d.cfg.start_direction, d.cfg.start_angle = 8, 315
+    source.video_render(d)
+    check(near(rendered_offset_x, 0.5625) and near(rendered_offset_y, 1),
+        'Custom 315 degree Peek In uses clockwise angle definition')
+    d.cfg.start_direction = 2
+    tick(d, p, 0.25); source.video_render(d)
+    check(near(rendered_offset_x, -0.5) and near(rendered_offset_y, 0) and d.alpha == 1,
+        'Peek In moves linearly without opacity change')
+    tick(d, p, 0.25); source.video_render(d)
+    check(d.state == 'VISIBLE' and rendered_offset_x == 0 and rendered_offset_y == 0,
+        'Peek reaches the unchanged normal position')
+    tick(d, p, 1.25); source.video_render(d)
+    check(d.state == 'ENDING' and near(rendered_offset_x, -0.5) and near(rendered_offset_y, 0)
+            and d.alpha == 1,
+        'Peek Out moves in its own default left direction')
+    tick(d, p, 0.25)
+    check(d.state == 'WAITING' and p.muted, 'Peek Out finishes fully hidden')
+    destroy(d, p, f)
+
+    d, p, f = make({display_duration = 2, start_effect = 3, start_duration = 0.5,
+        end_effect = 3, end_duration = 0.5}, false)
+    check(d.state == 'STARTING' and d.alpha == 1 and d.start_progress == 0 and p.muted,
+        'Wipe starts fully hidden without changing opacity')
+    local wipe_directions = {
+        {0, -1}, {math.sqrt(0.5), -math.sqrt(0.5)}, {1, 0},
+        {math.sqrt(0.5), math.sqrt(0.5)}, {0, 1},
+        {-math.sqrt(0.5), math.sqrt(0.5)}, {-1, 0},
+        {-math.sqrt(0.5), -math.sqrt(0.5)},
+    }
+    for direction_index, expected in ipairs(wipe_directions) do
+        d.cfg.start_direction = direction_index - 1
+        source.video_render(d)
+        check(near(rendered_wipe_x, expected[1]) and near(rendered_wipe_y, expected[2])
+                and rendered_wipe_progress == 0 and rendered_wipe_mode == 1,
+            'Wipe In boundary direction ' .. (direction_index - 1))
+    end
+    d.cfg.start_direction, d.cfg.start_angle = 8, 30
+    source.video_render(d)
+    check(near(rendered_wipe_x, 0.5) and near(rendered_wipe_y, -math.sqrt(0.75)),
+        'Custom 30 degree Wipe uses clockwise angle definition')
+    d.cfg.start_direction = 2
+    tick(d, p, 0.25); source.video_render(d)
+    check(rendered_wipe_x == 1 and rendered_wipe_y == 0
+            and near(rendered_wipe_progress, 0.5) and rendered_wipe_mode == 1 and d.alpha == 1,
+        'Wipe In boundary advances linearly without opacity change')
+    tick(d, p, 0.25); source.video_render(d)
+    check(d.state == 'VISIBLE' and rendered_wipe_mode == 0 and rendered_offset_x == 0
+            and rendered_offset_y == 0,
+        'Wipe reaches normal unshifted display')
+    tick(d, p, 1.25); source.video_render(d)
+    check(d.state == 'ENDING' and rendered_wipe_x == -1 and rendered_wipe_y == 0
+            and near(rendered_wipe_progress, 0.5) and rendered_wipe_mode == 2 and d.alpha == 1,
+        'Wipe Out uses its independent default left direction')
+    tick(d, p, 0.25)
+    check(d.state == 'WAITING' and p.muted, 'Wipe Out finishes fully hidden')
+    destroy(d, p, f)
+    d, p, f = make({first_display = 1, interval = -1, random_min = -2, random_max = -3,
+        display_duration = -1, start_duration = -1, end_duration = -1}, false)
+    check(d.cfg.interval == 0 and d.cfg.lo == 0 and d.cfg.hi == 0, 'Negative stored waits normalize to zero')
+    check(d.cfg.duration == 0.01 and d.cfg.fade_in == 0 and d.cfg.fade_out == 0,
+        'Negative stored display and fade times respect their different minima')
+    destroy(d, p, f)
+    d, p, f = make({interval_mode = 1, random_min = 60, random_max = 20, first_display = 1,
+        display_duration = 0.01, start_effect = 0, end_effect = 0}, false)
+    local previous, different = nil, false
+    for i = 1, 1000 do
+        check(d.wait_left >= 20 and d.wait_left <= 60, 'Random wait in normalized range')
+        different = different or previous ~= nil and previous ~= d.wait_left
+        previous = d.wait_left
+        local before = d.seed; tick(d, p, d.wait_left / 2)
+        check(d.seed == before, 'Random chosen once per wait')
+        tick(d, p, d.wait_left); tick(d, p, 0.01)
+    end
+    check(different, 'Random stream varies'); destroy(d, p, f)
+    d, p, f = make({display_duration = 5}, false)
+    obs.obs_data_set_double(f.settings, 'display_duration', 2)
+    source.update(d, f.settings)
+    tick(d, p, 4.9); check(d.state == 'ENDING', 'Config edits do not truncate current event')
+    tick(d, p, 0.1); tick(d, p, 30); tick(d, p, 2)
+    check(d.state == 'WAITING', 'New config used for next event'); destroy(d, p, f)
+
+    d, p, f = make({interval = 0.5}, true)
+    check(not d.ready and p.muted, 'Restart request is not decoder readiness')
+    for i = 1, 15 do tick(d, p, 1/60) end
+    check(d.ready and near(d.alpha, 0.5), 'Media fade follows current time')
+    emit(p, 'media_ended'); tick(d, p, 1/60)
+    check(d.state ~= 'WAITING', 'Stale ended notification is ignored while playing')
+    p.active = false; source.deactivate(d); tick(d, p, 1/60)
+    local position, alpha = p.position, d.alpha
+    tick(d, p, 100)
+    check(p.position == position and d.alpha == alpha and p.muted, 'Media and fade paused together')
+    p.active = true; tick(d, p, 1/60); tick(d, p, 1/60)
+    check(p.position > position and not p.muted, 'Media resumes from position')
+    for i = 1, 220 do tick(d, p, 1/60) end
+    check(p.restarts >= 2, 'Ended source restarts each event')
+    f.enabled = false; emit(f, 'enable', {enabled = false})
+    check(not p.muted and not d.owns, 'Enable signal immediately restores mute')
+    destroy(d, p, f)
+    d, p, f = make({}, true)
+    p.duration = 0
+    tick(d, p, 0.1)
+    for i = 1, 28 do tick(d, p, 0.1) end
+    check(d.alpha == 1, 'Unknown duration does not predict fade out')
+    tick(d, p, 0.11); check(d.state == 'WAITING' and p.muted, 'Unknown duration hides on ended')
+    destroy(d, p, f)
+    d, p, f = make({}, true)
+    for i = 1, 11 do tick(d, p, 1, false) end
+    check(d.state == 'WAITING' and p.muted and d.notice ~= '', 'Startup watchdog aborts safely')
+    destroy(d, p, f)
+    d, p, f = make({}, true)
+    obs.obs_data_set_bool(p.settings, 'looping', true)
+    tick(d, p, 0.1); check(d.invalid and d.alpha == 0 and p.muted, 'Invalid media config blocks events')
+    obs.obs_data_set_bool(p.settings, 'looping', false)
+    tick(d, p, 0); check(not d.invalid, 'Corrected conditions allow retry')
+    destroy(d, p, f)
+    d, p, f = make({}, false)
+    local d2, _, f2 = make({}, false, false, p)
+    check(d.owns and not d2.owns, 'Duplicate cannot take mute ownership')
+    bypassed = false; source.video_render(d2)
+    check(bypassed, 'Duplicate does not hide the controlling filter output')
+    source.destroy(d2); obs.obs_data_release(f2.settings)
+    emit(p, 'filter_remove', {filter = f})
+    check(not d.owns and not p.muted, 'Removal restores mute before destruction')
+    destroy(d, p, f)
+
+    d, p, f = make({}, true)
+    local restarts_before = p.restarts or 0
+    p.alive = false
+    source.destroy(d)
+    emit(p, 'destroy')
+    check(not d.owns and d.state == 'DISABLED' and d.alpha == 1,
+        'Destroy detaches ownership when parent weak reference is unavailable')
+    check((p.restarts or 0) == restarts_before, 'Unavailable parent does not restart media')
+    obs.obs_data_release(f.settings); obs.obs_data_release(p.settings)
+
+    local settings = obs.obs_data_create(); source.get_defaults(settings)
+    local props = source.get_properties(nil)
+    for _, key in ipairs({'interval', 'random_min', 'random_max', 'display_duration', 'start_duration', 'end_duration'}) do
+        local property = obs.obs_properties_get(props, key)
+        check(property ~= nil, 'Numeric property exists: ' .. key)
+        check(not obs.obs_property_modified(property, settings), 'Numbers do not rebuild properties: ' .. key)
+    end
+    obs.obs_data_set_int(settings, 'interval_mode', 1)
+    check(obs.obs_property_modified(obs.obs_properties_get(props, 'interval_mode'), settings), 'Mode updates visibility')
+    check(not obs.obs_property_visible(obs.obs_properties_get(props, 'interval')), 'Fixed field hidden')
+    check(obs.obs_property_visible(obs.obs_properties_get(props, 'random_min')), 'Random field shown')
+    check(not obs.obs_property_visible(obs.obs_properties_get(props, 'start_direction')),
+        'Peek direction hidden for Fade')
+    obs.obs_data_set_int(settings, 'start_effect', 2)
+    check(obs.obs_property_modified(obs.obs_properties_get(props, 'start_effect'), settings),
+        'Peek selection updates visibility')
+    check(obs.obs_property_visible(obs.obs_properties_get(props, 'start_direction'))
+            and not obs.obs_property_visible(obs.obs_properties_get(props, 'start_angle')),
+        'Peek shows direction but hides non-custom angle')
+    obs.obs_data_set_int(settings, 'start_effect', 3)
+    check(obs.obs_property_modified(obs.obs_properties_get(props, 'start_effect'), settings)
+            and obs.obs_property_visible(obs.obs_properties_get(props, 'start_direction')),
+        'Wipe selection reuses directional controls')
+    obs.obs_data_set_int(settings, 'start_direction', 8)
+    check(obs.obs_property_modified(obs.obs_properties_get(props, 'start_direction'), settings)
+            and obs.obs_property_visible(obs.obs_properties_get(props, 'start_angle')),
+        'Custom direction alone shows the angle field')
+    check(obs.obs_data_get_int(settings, 'end_direction') == 6,
+        'Default Peek directions are start right and end left')
+    local product_file=assert(io.open('ambient-source-events.lua','r'))
+    local product_source=assert(product_file:read('*a')); product_file:close()
+    check(not product_source:find('obs_sceneitem_set_',1,true),
+        'Product never changes Scene Item transforms')
+    obs.obs_properties_destroy(props); obs.obs_data_release(settings)
+    for name, fn in pairs(real) do obs[name] = fn end
+end
+local ok, reason = xpcall(test, debug.traceback)
+-- The harness must see explicit success: obs_script_loaded alone is insufficient.
+local f = assert(io.open('verification/test-result.txt', 'w'))
+f:write(ok and ('PASS: ' .. count .. ' state/data/property assertions\n') or ('FAIL: ' .. tostring(reason) .. '\n'))
+f:close()
+script_unload, script_tick = nil, nil
