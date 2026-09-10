@@ -6,7 +6,7 @@ OBS Studioの映像ソースを一定間隔、またはランダムな間隔で�
 基準環境: **macOS / OBS Studio 32.0.4 / SDR**
 実際の検証状況は [受入試験記録](verification/ACCEPTANCE.md) を参照してください。
 
-**初版とPeek・Wipe・Zoom・イージング基本機能、Wipe Softnessの受入確認は完了しています。** Zoom倍率UIの操作性修正とMedia Source非表示境界の1フレーム混入修正はガード付きunit・実GPU統合試験に合格し、実OBSでの最終目視確認待ちです。
+**初版とPeek・Wipe・Zoom・イージング基本機能、Wipe Softness、Zoom倍率UI、Media Source非表示境界の1フレーム混入修正の受入確認は完了しています。** Zoom倍率UIとMedia Source非表示境界の修正は、自動試験・実OBS目視確認ともに合格しています。
 
 現行コードの短時間統合試験は428項目、unit試験は6,918項目、初版に対する3分試験は82項目がネイティブ終了まで合格しました。
 
