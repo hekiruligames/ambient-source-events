@@ -937,7 +937,7 @@ end
 function script_description()
     return 'ソース定期表示（Ambient Source Events）0.7.0\n' ..
         '各ソースの「フィルタ → ＋ → ソース定期表示」から追加してください。\n' ..
-        '映像の定期表示・フェード・Peek・Wipe・Zoomと非表示中の消音。対応条件はREADME-ja.mdをご確認ください。'
+        '映像の定期表示・フェード・Peek・Wipe・Zoomと非表示中の消音。対応条件はREADME.mdをご確認ください。'
 end
 function script_load()
     exiting, unloading = false, false
