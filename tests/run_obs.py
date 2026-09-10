@@ -46,6 +46,9 @@ def main():
     parser.add_argument('--seconds', type=float, default=0)
     parser.add_argument('--modules', action='store_true')
     parser.add_argument('--audio', action='store_true')
+    parser.add_argument('--video-probe', action='store_true')
+    parser.add_argument('--expect-video-hidden', action='store_true')
+    parser.add_argument('--expect-video-hidden-tail-min', type=int, default=0)
     parser.add_argument('--reloads', type=int, default=0)
     args = parser.parse_args()
     native_guard = require_native_guard()
@@ -73,7 +76,8 @@ def main():
     script = None
     loaded = False
     graphics_ready = False
-    managed_cleanup = Path(args.script).name in ('integration.lua', 'lifecycle.lua')
+    managed_cleanup = Path(args.script).name in (
+        'integration.lua', 'lifecycle.lua', 'media_generation_boundary.lua')
     result_path = OUT / 'test-result.txt'
     result_path.unlink(missing_ok=True)
     for filename in ('cleanup-request.txt', 'cleanup-ready.txt', 'unload-result.txt',
@@ -83,6 +87,8 @@ def main():
     audio_callback = None
     audio_output = None
     audio_samples = []
+    video_callback = None
+    video_samples = []
     reload_count = 0
     try:
         if args.graphics:
@@ -120,6 +126,29 @@ def main():
             audio_output = bind(core, 'obs_get_audio', C.c_void_p)()
             assert bind(core, 'audio_output_connect', C.c_bool, C.c_void_p, C.c_size_t,
                         C.c_void_p, callback_type, C.c_void_p)(audio_output, 0, None, audio_callback, None)
+        if args.video_probe:
+            class VideoScaleInfo(C.Structure):
+                _fields_ = [('format', C.c_int), ('width', C.c_uint32), ('height', C.c_uint32),
+                            ('range', C.c_int), ('colorspace', C.c_int)]
+            class VideoData(C.Structure):
+                _fields_ = [('data', C.POINTER(C.c_uint8) * 8),
+                            ('linesize', C.c_uint32 * 8), ('timestamp', C.c_uint64)]
+            video_callback_type = C.CFUNCTYPE(None, C.c_void_p, C.POINTER(VideoData))
+
+            @video_callback_type
+            def video_callback(_, data):
+                frame = data.contents
+                if not frame.data[0]:
+                    return
+                values = []
+                for x, y in ((80, 45), (160, 90), (240, 135)):
+                    offset = y * frame.linesize[0] + x * 4
+                    values.append(tuple(int(frame.data[0][offset + channel]) for channel in range(4)))
+                video_samples.append((int(frame.timestamp), values))
+
+            conversion = VideoScaleInfo(6, 1920, 1080, 2, 3)
+            bind(core, 'obs_add_raw_video_callback', None, C.POINTER(VideoScaleInfo),
+                 video_callback_type, C.c_void_p)(C.byref(conversion), video_callback, None)
         assert bind(scripting, 'obs_scripting_load', C.c_bool)()
         loaded = True
         create = bind(scripting, 'obs_script_create', C.c_void_p, C.c_char_p, C.c_void_p)
@@ -170,12 +199,33 @@ def main():
             assert len(silent) >= 10 and max(silent) <= 1e-6, report | {'samples': 'omitted'}
             assert len(audible) >= 10 and max(audible) > 0.01, report | {'samples': 'omitted'}
             print('PASS: actual mixed audio silence/restoration:', report | {'samples': 'omitted'}, flush=True)
+        if args.video_probe:
+            probe = [{'timestamp': timestamp, 'pixels': pixels}
+                     for timestamp, pixels in video_samples]
+            (OUT / 'video-probe.json').write_text(json.dumps(probe))
+            visible = [any(sum(pixel[:3]) > 24 for pixel in pixels) for _, pixels in video_samples]
+            runs = []
+            for value in visible:
+                if runs and runs[-1][0] == value:
+                    runs[-1][1] += 1
+                else:
+                    runs.append([value, 1])
+            report = {'frames': len(visible), 'runs': runs}
+            print('RAW VIDEO PROBE:', report, flush=True)
+            if args.expect_video_hidden:
+                assert visible and not any(visible), report
+            if args.expect_video_hidden_tail_min:
+                assert (any(visible) and runs and not runs[-1][0]
+                        and runs[-1][1] >= args.expect_video_hidden_tail_min), report
     finally:
         class Runtime:
             def disconnect_audio(self):
                 if audio_callback and audio_output:
                     bind(core, 'audio_output_disconnect', None, C.c_void_p, C.c_size_t,
                          callback_type, C.c_void_p)(audio_output, 0, audio_callback, None)
+                if video_callback:
+                    bind(core, 'obs_remove_raw_video_callback', None,
+                         video_callback_type, C.c_void_p)(video_callback, None)
 
             def await_cleanup(self):
                 if not managed_cleanup or not script:

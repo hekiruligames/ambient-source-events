@@ -418,6 +418,125 @@ local function test()
         'Zoom Out supports above 100 percent with an independent bottom-left anchor')
     destroy(d, p, f)
 
+    for _, percent in ipairs({50, 100, 1000}) do
+        for _, easing_mode in ipairs({0, 3}) do
+            local target = percent / 100
+            d, p, f = make({display_duration = 1, start_effect = 4, start_duration = 0.25,
+                start_zoom_percent = percent, start_easing = easing_mode, end_effect = 0}, false)
+            local saw_starting, saw_visible, previous_scale = false, false, nil
+            for frame = 0, 120 do
+                rendered_scale_x, rendered_scale_y = nil, nil
+                source.video_render(d)
+                local scale = rendered_scale_x
+                check(scale ~= nil and near(scale, rendered_scale_y),
+                    'Start-only Zoom keeps equal axes on frame ' .. frame .. ' at ' .. percent)
+                if d.state == 'STARTING' then
+                    saw_starting = true
+                    local expected = target + (1 - target) * d.start_progress
+                    check(near(scale, expected) and d.end_progress == 0,
+                        'Start-only Zoom uses only start progress on frame ' .. frame .. ' at ' .. percent)
+                    if previous_scale then
+                        check((target <= 1 and scale + 1e-9 >= previous_scale)
+                                or (target > 1 and scale - 1e-9 <= previous_scale),
+                            'Start-only Zoom approaches 100 percent monotonically at ' .. percent)
+                    end
+                    previous_scale = scale
+                elseif d.state == 'VISIBLE' then
+                    saw_visible = true
+                    check(scale == 1 and d.start_progress == 1 and d.end_progress == 0,
+                        'Start-only Zoom stays at 100 percent after completion at ' .. percent)
+                elseif d.state == 'WAITING' then
+                    check(d.alpha == 0 and scale == 1 and d.start_progress == 0
+                            and d.end_progress == 0 and saw_starting and saw_visible,
+                        'Start-only Zoom becomes hidden after resetting inactive progress at ' .. percent)
+                    break
+                end
+                tick(d, p, 1 / 120)
+            end
+            check(d.state == 'WAITING', 'Start-only Zoom reaches its hidden state at ' .. percent)
+            destroy(d, p, f)
+
+            d, p, f = make({display_duration = 1, start_effect = 0, end_effect = 4,
+                end_duration = 0.25, end_zoom_percent = percent, end_easing = easing_mode}, false)
+            local saw_ending, last_ending_scale = false, nil
+            for frame = 0, 120 do
+                rendered_scale_x, rendered_scale_y = nil, nil
+                source.video_render(d)
+                local scale = rendered_scale_x
+                check(scale ~= nil and near(scale, rendered_scale_y),
+                    'End-only Zoom keeps equal axes on frame ' .. frame .. ' at ' .. percent)
+                if d.state == 'VISIBLE' then
+                    check(scale == 1 and d.start_progress == 1 and d.end_progress == 0,
+                        'End-only Zoom remains at 100 percent before its end effect at ' .. percent)
+                elseif d.state == 'ENDING' then
+                    saw_ending = true
+                    local expected = 1 + (target - 1) * d.end_progress
+                    check(near(scale, expected) and d.start_progress == 1,
+                        'End-only Zoom uses only end progress on frame ' .. frame .. ' at ' .. percent)
+                    if last_ending_scale then
+                        check((target <= 1 and scale <= last_ending_scale + 1e-9)
+                                or (target > 1 and scale >= last_ending_scale - 1e-9),
+                            'End-only Zoom approaches its target monotonically at ' .. percent)
+                    end
+                    last_ending_scale = scale
+                elseif d.state == 'WAITING' then
+                    check(d.alpha == 0 and scale == 1 and d.start_progress == 0
+                            and d.end_progress == 0 and saw_ending,
+                        'End-only Zoom becomes hidden after resetting inactive progress at ' .. percent)
+                    break
+                end
+                tick(d, p, 1 / 120)
+            end
+            check(d.state == 'WAITING', 'End-only Zoom reaches its hidden state at ' .. percent)
+            destroy(d, p, f)
+        end
+    end
+
+    for _, percent in ipairs({50, 500, 501, 1000, 3000, 5000}) do
+        d, p, f = make({display_duration = 2, start_effect = 4, start_zoom_percent = percent,
+            end_effect = 4, end_zoom_percent = percent + 1}, false)
+        check(near(d.cfg.start_zoom_scale, percent / 100)
+                and near(d.cfg.end_zoom_scale, (percent + 1) / 100),
+            'Existing Zoom settings remain authoritative at ' .. percent .. ' percent')
+        check(obs.obs_data_get_bool(f.settings, 'start_zoom_high_mode') == (percent > 500),
+            'Existing ' .. percent .. ' percent selects a compatible Zoom UI mode')
+        source.video_render(d)
+        check(near(rendered_scale_x, percent / 100) and near(rendered_scale_y, percent / 100),
+            'High Zoom setting reaches rendering at ' .. percent .. ' percent')
+        if percent == 3000 then
+            local high_props = source.get_properties(d)
+            check(obs.obs_data_get_double(f.settings, 'start_zoom_percent') == 3000
+                    and obs.obs_data_get_bool(f.settings, 'start_zoom_high_mode')
+                    and obs.obs_data_get_double(f.settings, 'start_zoom_normal_percent') == 500
+                    and obs.obs_property_visible(obs.obs_properties_get(high_props,
+                        'start_zoom_percent'))
+                    and not obs.obs_property_visible(obs.obs_properties_get(high_props,
+                        'start_zoom_normal_percent')),
+                'Existing 3000 percent settings open in high mode without clamping the value')
+            obs.obs_properties_destroy(high_props)
+        end
+        destroy(d, p, f)
+    end
+
+    d, p, f = make({display_duration = 2, start_effect = 4, start_zoom_percent = 50}, false)
+    local live_zoom_props = source.get_properties(d)
+    local live_zoom_normal = obs.obs_properties_get(live_zoom_props, 'start_zoom_normal_percent')
+    obs.obs_data_set_double(f.settings, 'start_zoom_normal_percent', 250)
+    check(not obs.obs_property_modified(live_zoom_normal, f.settings)
+            and obs.obs_data_get_double(f.settings, 'start_zoom_percent') == 250,
+        'Normal Zoom UI writes its authoritative multiplier without rebuilding properties')
+    source.update(d, f.settings)
+    check(near(d.pending_cfg.start_zoom_scale, 2.5),
+        'Normal Zoom UI multiplier reaches the authoritative pending configuration')
+    tick(d, p, 2)
+    tick(d, p, 30)
+    source.video_render(d)
+    check(near(d.cfg.start_zoom_scale, 2.5)
+            and near(rendered_scale_x, 2.5) and near(rendered_scale_y, 2.5),
+        'Normal Zoom UI multiplier reaches the next Zoom rendering event')
+    obs.obs_properties_destroy(live_zoom_props)
+    destroy(d, p, f)
+
     d, p, f = make({display_duration = 1, start_effect = 4, start_duration = 0.5,
         start_zoom_percent = 0, end_effect = 0}, false)
     rendered_scale_x, rendered_scale_y, rendered_translate_x, rendered_translate_y = nil, nil, nil, nil
@@ -563,6 +682,58 @@ local function test()
     tick(d, p, 0.1); tick(d, p, 30); tick(d, p, 2)
     check(d.state == 'WAITING', 'New config used for next event'); destroy(d, p, f)
 
+    for _, boundary in ipairs({
+            {name = 'start-only 50 percent', start_effect = 4, end_effect = 0, percent = 50},
+            {name = 'start-only 1000 percent', start_effect = 4, end_effect = 0, percent = 1000},
+            {name = 'end-only 50 percent', start_effect = 0, end_effect = 4, percent = 50},
+            {name = 'end-only 1000 percent', start_effect = 0, end_effect = 4, percent = 1000},
+        }) do
+        d, p, f = make({interval = 30, start_effect = boundary.start_effect,
+            end_effect = boundary.end_effect, start_zoom_percent = boundary.percent,
+            end_zoom_percent = boundary.percent}, true, false, nil, function(_, parent)
+                parent.media_state, parent.position = obs.OBS_MEDIA_STATE_PLAYING, 66
+            end)
+        p.commands = {}
+        d.restart_ack, d.started_signal = d.generation, d.generation
+        local boundary_alphas = {}
+        for _, sample in ipairs({
+                {obs.OBS_MEDIA_STATE_PLAYING, 69},
+                {obs.OBS_MEDIA_STATE_PLAYING, 23},
+                {obs.OBS_MEDIA_STATE_ENDED, 33},
+            }) do
+            p.media_state, p.position = sample[1], sample[2]
+            if sample[1] == obs.OBS_MEDIA_STATE_ENDED then emit(p, 'media_ended') end
+            source.video_tick(d, 1 / 60)
+            rendered_alpha = nil
+            source.video_render(d)
+            boundary_alphas[#boundary_alphas + 1] = rendered_alpha
+        end
+        check(boundary_alphas[1] == 0 and boundary_alphas[2] == 0
+                and boundary_alphas[3] == 0 and d.state == 'WAITING' and p.muted,
+            'Stale Media restart stays pixel-hidden across ' .. boundary.name .. ' boundary')
+        destroy(d, p, f)
+
+        d, p, f = make({interval = 30, start_effect = boundary.start_effect,
+            end_effect = boundary.end_effect, start_zoom_percent = boundary.percent,
+            end_zoom_percent = boundary.percent}, true)
+        p.commands = {}
+        d.restart_ack, d.started_signal = d.generation, d.generation
+        local generation_alphas = {}
+        for _, position in ipairs({23, 33, 500, 23}) do
+            p.media_state, p.position = obs.OBS_MEDIA_STATE_PLAYING, position
+            source.video_tick(d, 1 / 60)
+            rendered_alpha = nil
+            source.video_render(d)
+            generation_alphas[#generation_alphas + 1] = rendered_alpha
+        end
+        check(generation_alphas[1] == 0 and generation_alphas[2] == 1
+                and generation_alphas[3] == 1 and generation_alphas[4] == 0
+                and d.state == 'WAITING' and p.muted,
+            'Media playhead wrap becomes hidden before ENDED across '
+                .. boundary.name .. ' boundary')
+        destroy(d, p, f)
+    end
+
     d, p, f = make({interval = 0.5}, true)
     check(not d.ready and p.muted, 'Restart request is not decoder readiness')
     for i = 1, 15 do tick(d, p, 1/60) end
@@ -620,8 +791,7 @@ local function test()
     local settings = obs.obs_data_create(); source.get_defaults(settings)
     local props = source.get_properties(nil)
     for _, key in ipairs({'interval', 'random_min', 'random_max', 'display_duration', 'start_duration',
-            'end_duration', 'start_zoom_percent', 'end_zoom_percent',
-            'start_softness', 'end_softness'}) do
+            'end_duration', 'start_softness', 'end_softness'}) do
         local property = obs.obs_properties_get(props, key)
         check(property ~= nil, 'Numeric property exists: ' .. key)
         check(not obs.obs_property_modified(property, settings), 'Numbers do not rebuild properties: ' .. key)
@@ -694,16 +864,93 @@ local function test()
     obs.obs_data_set_int(settings, 'start_effect', 4)
     check(obs.obs_property_modified(obs.obs_properties_get(props, 'start_effect'), settings)
             and obs.obs_property_visible(obs.obs_properties_get(props, 'start_zoom_anchor'))
-            and obs.obs_property_visible(obs.obs_properties_get(props, 'start_zoom_percent'))
+            and obs.obs_property_visible(obs.obs_properties_get(props, 'start_zoom_normal_percent'))
+            and not obs.obs_property_visible(obs.obs_properties_get(props, 'start_zoom_percent'))
+            and obs.obs_property_visible(obs.obs_properties_get(props, 'start_zoom_high_mode'))
             and not obs.obs_property_visible(obs.obs_properties_get(props, 'start_direction'))
             and not obs.obs_property_visible(obs.obs_properties_get(props, 'start_angle'))
             and not obs.obs_property_visible(obs.obs_properties_get(props, 'start_softness')),
-        'Zoom selection hides Wipe direction, angle, and Softness controls')
+        'Normal Zoom shows one standard multiplier slider and hides unrelated controls')
     check(obs.obs_data_get_double(settings, 'start_zoom_percent') == 50
             and obs.obs_data_get_double(settings, 'end_zoom_percent') == 50
             and obs.obs_data_get_int(settings, 'start_zoom_anchor') == 4
             and obs.obs_data_get_int(settings, 'end_zoom_anchor') == 4,
         'Zoom defaults are 50 percent and centered independently')
+    obs.obs_data_set_int(settings, 'end_effect', 4)
+    check(obs.obs_property_modified(obs.obs_properties_get(props, 'end_effect'), settings)
+            and obs.obs_property_visible(obs.obs_properties_get(props, 'end_zoom_normal_percent')),
+        'Zoom Out independently shows its standard multiplier slider')
+    for _, prefix in ipairs({'start', 'end'}) do
+        local percent_key = prefix .. '_zoom_percent'
+        local normal_key = prefix .. '_zoom_normal_percent'
+        local mode_key = prefix .. '_zoom_high_mode'
+        local percent_property = obs.obs_properties_get(props, percent_key)
+        local normal_property = obs.obs_properties_get(props, normal_key)
+        local mode_property = obs.obs_properties_get(props, mode_key)
+        check(percent_property ~= nil and obs.obs_property_float_min(percent_property) == 0
+                and obs.obs_property_float_max(percent_property) == 1000000
+                and obs.obs_property_float_step(percent_property) == 10
+                and normal_property ~= nil and obs.obs_property_float_min(normal_property) == 0
+                and obs.obs_property_float_max(normal_property) == 500
+                and obs.obs_property_float_step(normal_property) == 0.1
+                and obs.obs_property_float_type(normal_property) == obs.OBS_NUMBER_SLIDER
+                and mode_property ~= nil,
+            prefix .. ' Zoom uses 0.1-percent normal and ten-percent high steps')
+        for _, percent in ipairs({0, 50, 100, 250, 500}) do
+            obs.obs_data_set_double(settings, normal_key, percent)
+            check(not obs.obs_property_modified(normal_property, settings)
+                    and obs.obs_data_get_double(settings, percent_key) == percent
+                    and obs.obs_data_get_double(settings, normal_key) == percent,
+                prefix .. ' standard Zoom slider adopts ' .. percent .. ' without a UI refresh')
+        end
+        obs.obs_data_set_double(settings, normal_key, 125.5)
+        check(not obs.obs_property_modified(normal_property, settings)
+                and obs.obs_data_get_double(settings, percent_key) == 125.5
+                and obs.obs_data_get_double(settings, normal_key) == 125.5,
+            prefix .. ' standard Zoom slider keeps decimal precision without refresh')
+        check(not obs.obs_property_modified(percent_property, settings),
+            prefix .. ' high Zoom number has no callback and cannot refresh properties')
+        for _, percent in ipairs({501, 1000, 1020.5, 3000, 5000}) do
+            obs.obs_data_set_double(settings, percent_key, percent)
+            check(not obs.obs_property_modified(percent_property, settings)
+                    and obs.obs_data_get_double(settings, percent_key) == percent,
+                prefix .. ' high Zoom number stays at ' .. percent .. ' without a UI refresh')
+        end
+    end
+    obs.obs_data_set_double(settings, 'start_zoom_normal_percent', 150)
+    obs.obs_property_modified(obs.obs_properties_get(props, 'start_zoom_normal_percent'), settings)
+    obs.obs_data_set_bool(settings, 'start_zoom_high_mode', true)
+    check(obs.obs_property_modified(obs.obs_properties_get(props, 'start_zoom_high_mode'), settings)
+            and obs.obs_data_get_double(settings, 'start_zoom_percent') == 150
+            and obs.obs_property_visible(obs.obs_properties_get(props, 'start_zoom_percent'))
+            and not obs.obs_property_visible(obs.obs_properties_get(props, 'start_zoom_normal_percent')),
+        'Normal 150 percent transfers unchanged when high mode is enabled')
+    obs.obs_data_set_double(settings, 'start_zoom_percent', 350)
+    obs.obs_data_set_bool(settings, 'start_zoom_high_mode', false)
+    check(obs.obs_property_modified(obs.obs_properties_get(props, 'start_zoom_high_mode'), settings)
+            and obs.obs_data_get_double(settings, 'start_zoom_percent') == 350
+            and obs.obs_data_get_double(settings, 'start_zoom_normal_percent') == 350,
+        'High 350 percent transfers unchanged when normal mode is enabled')
+    obs.obs_data_set_bool(settings, 'start_zoom_high_mode', true)
+    obs.obs_property_modified(obs.obs_properties_get(props, 'start_zoom_high_mode'), settings)
+    obs.obs_data_set_double(settings, 'start_zoom_percent', 3000)
+    obs.obs_data_set_bool(settings, 'start_zoom_high_mode', false)
+    check(obs.obs_property_modified(obs.obs_properties_get(props, 'start_zoom_high_mode'), settings)
+            and obs.obs_data_get_double(settings, 'start_zoom_percent') == 500
+            and obs.obs_data_get_double(settings, 'start_zoom_normal_percent') == 500,
+        'Disabling high mode clamps current 3000 percent to 500 percent')
+    obs.obs_data_set_bool(settings, 'start_zoom_high_mode', true)
+    check(obs.obs_property_modified(obs.obs_properties_get(props, 'start_zoom_high_mode'), settings)
+            and obs.obs_data_get_double(settings, 'start_zoom_percent') == 500,
+        'Re-enabling high mode does not restore an old 3000 percent value')
+    obs.obs_data_set_bool(settings, 'end_zoom_high_mode', true)
+    obs.obs_property_modified(obs.obs_properties_get(props, 'end_zoom_high_mode'), settings)
+    obs.obs_data_set_double(settings, 'end_zoom_percent', 1200)
+    check(obs.obs_data_get_bool(settings, 'start_zoom_high_mode')
+            and obs.obs_data_get_bool(settings, 'end_zoom_high_mode')
+            and obs.obs_data_get_double(settings, 'start_zoom_percent') == 500
+            and obs.obs_data_get_double(settings, 'end_zoom_percent') == 1200,
+        'Start and end Zoom modes and authoritative multipliers remain independent')
     local anchor_items = {
         {'● 中央', 4}, {'↑ 上', 1}, {'↗ 右上', 2},
         {'→ 右', 5}, {'↘ 右下', 8}, {'↓ 下', 7},

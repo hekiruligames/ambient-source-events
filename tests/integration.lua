@@ -36,7 +36,7 @@ local outcome, cleanup_frame, render_registered, cleanup_failed = nil, nil, fals
 local snapshots, history = {}, {}
 local scene_a, scene_b, image, peek, peek_angle, wipe_horizontal, wipe_vertical
 local wipe_diagonal, wipe_angle, soft_wipe, soft_reference
-local zoom_reference, zoom_shrink, zoom_grow, zoom_zero
+local zoom_reference, zoom_shrink, zoom_grow, zoom_zero, zoom_start_only, zoom_end_only
 local easing_fade
 local white, media, gif_image, gif_media, text_source
 local original_load, original_unload, original_tick
@@ -221,6 +221,12 @@ local function setup()
     zoom_zero=make_source('image_source','ASE Zoom zero PNG',{file=root..'alpha.png'},
         {first_display=1,interval=1,display_duration=2,start_effect=4,end_effect=0,
             start_duration=0.5,start_zoom_percent=0,start_zoom_anchor=4})
+    zoom_start_only=make_source('image_source','ASE Zoom start-only PNG',{file=root..'alpha.png'},
+        {first_display=1,interval=1,display_duration=2,start_effect=4,end_effect=0,
+            start_duration=0.5,start_zoom_percent=50,start_zoom_anchor=4,start_easing=0})
+    zoom_end_only=make_source('image_source','ASE Zoom end-only PNG',{file=root..'alpha.png'},
+        {first_display=1,interval=1,display_duration=2,start_effect=0,end_effect=4,
+            end_duration=0.5,end_zoom_percent=50,end_zoom_anchor=4,end_easing=3})
     easing_fade=make_source('image_source','ASE Easing Fade',{file=root..'alpha.png'},
         {first_display=1,interval=1,display_duration=2,start_effect=1,end_effect=1,
             start_duration=1,end_duration=1,start_easing=0,end_easing=3})
@@ -301,7 +307,7 @@ local function step(dt)
         check(obs.obs_source_get_width(soft_wipe.filter)==320
                 and obs.obs_source_get_height(soft_wipe.filter)==180,
             'Soft Wipe keeps the source output size')
-        for _,zoom in ipairs({zoom_shrink,zoom_grow,zoom_zero}) do
+        for _,zoom in ipairs({zoom_shrink,zoom_grow,zoom_zero,zoom_start_only,zoom_end_only}) do
             check(obs.obs_source_get_width(zoom.filter)==320 and obs.obs_source_get_height(zoom.filter)==180,
                 'Zoom keeps Scene Item source dimensions: '..zoom.name)
         end
@@ -324,6 +330,8 @@ local function step(dt)
         for _,key in ipairs({'waiting','half','visible','ending','peek-start-outside','peek-end-outside',
                 'wipe-start-hidden','wipe-end-hidden','zoom-zero','zoom-shrink-in-half',
                 'zoom-shrink-out-half','zoom-grow-in','zoom-grow-out',
+                'zoom-start-only-near-end','zoom-start-only-visible','zoom-start-only-hidden',
+                'zoom-end-only-near-start','zoom-end-only-near-end','zoom-end-only-hidden',
                 'soft-wipe-in','soft-wipe-out','soft-wipe-in-near-end',
                 'soft-wipe-in-end','soft-wipe-out-near-end','soft-wipe-out-end'}) do
             check(snapshots[key]~=nil,'Captured GPU '..key)
@@ -545,6 +553,57 @@ local function render()
         end
         check(zd.alpha==1,'Zero percent Zoom does not use opacity')
         snapshots['zoom-zero']=pixels
+    end
+    local zsi=zoom_start_only.data
+    if zsi.owns and zsi.active and zsi.state=='STARTING' and zsi.start_progress>0.94
+            and not snapshots['zoom-start-only-near-end'] then
+        local scale=0.5+0.5*zsi.start_progress
+        check_zoom_pixels(zoom_start_only,'zoom-start-only-near-end',scale,0.5,0.5,
+            {width=320,height=180})
+        check(zsi.end_progress==0,'Start-only Zoom does not borrow end progress near completion')
+    elseif zsi.owns and zsi.active and zsi.state=='VISIBLE'
+            and snapshots['zoom-start-only-near-end']
+            and not snapshots['zoom-start-only-visible'] then
+        check_zoom_pixels(zoom_start_only,'zoom-start-only-visible',1,0.5,0.5,
+            {width=320,height=180})
+        check(zsi.start_progress==1 and zsi.end_progress==0,
+            'Start-only Zoom holds its completed endpoint during normal display')
+    elseif zsi.owns and zsi.active and zsi.state=='WAITING'
+            and snapshots['zoom-start-only-visible']
+            and not snapshots['zoom-start-only-hidden'] then
+        local pixels=capture(zoom_start_only.name,'zoom-start-only-hidden')
+        for index,pixel in ipairs(pixels) do
+            check(pixel[1]==0 and pixel[2]==0 and pixel[3]==0 and pixel[4]==0,
+                'Start-only Zoom is fully hidden without a reset frame '..index)
+        end
+        check(zsi.start_progress==0 and zsi.end_progress==0,
+            'Start-only Zoom resets inactive progress while hidden')
+        snapshots['zoom-start-only-hidden']=pixels
+    end
+    local zei=zoom_end_only.data
+    if zei.owns and zei.active and zei.state=='ENDING' and zei.end_progress<0.06
+            and not snapshots['zoom-end-only-near-start'] then
+        local scale=1-0.5*zei.end_progress
+        check_zoom_pixels(zoom_end_only,'zoom-end-only-near-start',scale,0.5,0.5,
+            {width=320,height=180})
+        check(zei.start_progress==1,'End-only Zoom starts after the normal visible state')
+    elseif zei.owns and zei.active and zei.state=='ENDING' and zei.end_progress>0.94
+            and not snapshots['zoom-end-only-near-end'] then
+        local scale=1-0.5*zei.end_progress
+        check_zoom_pixels(zoom_end_only,'zoom-end-only-near-end',scale,0.5,0.5,
+            {width=320,height=180})
+        check(zei.start_progress==1,'End-only Zoom keeps start completion near its endpoint')
+    elseif zei.owns and zei.active and zei.state=='WAITING'
+            and snapshots['zoom-end-only-near-end']
+            and not snapshots['zoom-end-only-hidden'] then
+        local pixels=capture(zoom_end_only.name,'zoom-end-only-hidden')
+        for index,pixel in ipairs(pixels) do
+            check(pixel[1]==0 and pixel[2]==0 and pixel[3]==0 and pixel[4]==0,
+                'End-only Zoom is fully hidden without a 100 percent reset frame '..index)
+        end
+        check(zei.start_progress==0 and zei.end_progress==0,
+            'End-only Zoom resets inactive progress while hidden')
+        snapshots['zoom-end-only-hidden']=pixels
     end
     local zs=zoom_shrink.data
     if zs.owns and zs.active and zs.state=='STARTING' and near(zs.start_progress,0.5,0.05)

@@ -1,4 +1,4 @@
--- Ambient Source Events 0.6.1 / OBS Studio 32.0.4
+-- Ambient Source Events 0.7.0 / OBS Studio 32.0.4
 -- Source timing belongs to video_tick; video_render never advances time.
 local obs = obslua
 local bit = require('bit')
@@ -386,6 +386,8 @@ local function waiting(d, initial)
     d.wait_left = initial and d.cfg.immediate and 0 or random_wait(d)
     d.request_pending, d.ready, d.paused_by_us = false, false, false
     d.watchdog, d.last_position = 0, nil
+    d.before_restart, d.before_restart_active = nil, nil
+    d.restart_observed_position, d.rewind_position = nil, nil
     d.restart_ack, d.ended_signal, d.started_signal = nil, nil, nil
 end
 local function acquire(d, p)
@@ -430,7 +432,13 @@ local function start_event(d, p)
     if d.media then
         d.request_pending = true
         d.before_restart = obs.obs_source_media_get_time(p)
-        d.last_position = nil
+        local before_state = obs.obs_source_media_get_state(p)
+        d.before_restart_active = before_state == obs.OBS_MEDIA_STATE_PLAYING
+            or before_state == obs.OBS_MEDIA_STATE_OPENING
+            or before_state == obs.OBS_MEDIA_STATE_BUFFERING
+            or before_state == obs.OBS_MEDIA_STATE_PAUSED
+        d.restart_observed_position = d.before_restart
+        d.rewind_position, d.last_position = nil, nil
         mute(d, p, true)
         obs.obs_source_media_restart(p)
         obs.obs_source_media_play_pause(p, false)
@@ -462,9 +470,28 @@ local function media_tick(d, p, seconds)
     end
     if not d.ready then
         d.watchdog = d.watchdog + seconds
-        -- The restart signal confirms command dispatch, not decoder readiness.
-        local rewound = position < d.before_restart or position <= 250 * d.speed
-        if acknowledged and state == obs.OBS_MEDIA_STATE_PLAYING and position > 0 and rewound then
+        -- Restart/started signals only confirm command dispatch. Keep the
+        -- filter hidden until the reported playhead has both entered the new
+        -- generation and advanced within it. A low stale PLAYING position can
+        -- otherwise be exposed for one frame before a delayed ENDED state.
+        local started = d.started_signal == d.generation
+        local advanced_after_rewind = false
+        if acknowledged and started and state == obs.OBS_MEDIA_STATE_PLAYING then
+            local observed = d.restart_observed_position or d.before_restart or position
+            if d.rewind_position ~= nil then
+                if position < d.rewind_position then
+                    d.rewind_position = position
+                elseif position > d.rewind_position then
+                    advanced_after_rewind = true
+                end
+            elseif position <= 0 or position < observed
+                    or (not d.before_restart_active and position <= 250 * d.speed) then
+                d.rewind_position = position
+            else
+                d.restart_observed_position = math.max(observed, position)
+            end
+        end
+        if advanced_after_rewind then
             d.ready, d.request_pending, d.watchdog = true, false, 0
             d.last_position = position
             log(d, '')
@@ -477,7 +504,14 @@ local function media_tick(d, p, seconds)
         end_event(d, p, 'メディアが停止またはエラーになりました。次の間隔後に再試行します。')
         return
     end
-    if position > (d.last_position or -1) then
+    if d.last_position ~= nil and position < d.last_position then
+        -- A non-looping Media Source can report the first frame as PLAYING
+        -- immediately before its delayed ENDED notification. Treat a backward
+        -- playhead jump as the end of this controlled generation so that the
+        -- rewound frame never reaches video_render.
+        end_event(d, p)
+        return
+    elseif position > (d.last_position or -1) then
         d.last_position, d.watchdog = position, 0
     else d.watchdog = d.watchdog + seconds end
     if d.watchdog >= WATCHDOG then
@@ -576,6 +610,7 @@ info.get_defaults = function(s)
     for k, v in pairs({interval = 30, random_min = 20, random_max = 60,
         display_duration = 5, start_duration = 0.5, end_duration = 0.5,
         start_zoom_percent = 50, end_zoom_percent = 50,
+        start_zoom_normal_percent = 50, end_zoom_normal_percent = 50,
         start_softness = 0, end_softness = 0}) do
         obs.obs_data_set_default_double(s, k, v)
     end
@@ -585,8 +620,27 @@ info.get_defaults = function(s)
         start_easing = LINEAR, end_easing = LINEAR}) do
         obs.obs_data_set_default_int(s, k, v)
     end
+    obs.obs_data_set_default_bool(s, 'start_zoom_high_mode', false)
+    obs.obs_data_set_default_bool(s, 'end_zoom_high_mode', false)
+end
+local function initialize_zoom_ui(settings)
+    for _, prefix in ipairs({'start', 'end'}) do
+        local percent_key = prefix .. '_zoom_percent'
+        local normal_key = prefix .. '_zoom_normal_percent'
+        local mode_key = prefix .. '_zoom_high_mode'
+        local percent = obs.obs_data_get_double(settings, percent_key)
+        if not finite(percent) then percent = 50 end
+        percent = clamp(percent, 0, ZOOM_UI_MAX)
+        if not obs.obs_data_has_user_value(settings, mode_key) then
+            obs.obs_data_set_bool(settings, mode_key, percent > 500)
+        end
+        obs.obs_data_set_double(settings, normal_key, clamp(percent, 0, 500))
+        obs.obs_data_set_double(settings, percent_key, percent)
+        obs.obs_data_unset_user_value(settings, percent_key .. '_slider')
+    end
 end
 info.create = function(settings, source)
+    initialize_zoom_ui(settings)
     serial = serial + 1
     local seed = (os.time() + serial * 104729 + math.floor(os.clock() * 1000000)) % 2147483646 + 1
     local d = {context = source, cfg = config(settings), state = 'WAITING', alpha = 0,
@@ -734,7 +788,32 @@ local function add_seconds(props, key, label, minimum)
     obs.obs_property_float_set_suffix(p, ' 秒')
     return p
 end
-local function layout(props, _, settings)
+local layout
+local function zoom_normal_changed(_, property, settings)
+    local normal_key = obs.obs_property_name(property)
+    local percent_key = normal_key:gsub('_normal_percent$', '_percent')
+    local percent = clamp(obs.obs_data_get_double(settings, normal_key), 0, 500)
+    obs.obs_data_set_double(settings, percent_key, percent)
+    return false
+end
+local function zoom_mode_changed(props, property, settings)
+    local mode_key = obs.obs_property_name(property)
+    local prefix = mode_key:gsub('_zoom_high_mode$', '')
+    local percent_key = prefix .. '_zoom_percent'
+    local normal_key = prefix .. '_zoom_normal_percent'
+    local percent = obs.obs_data_get_double(settings, percent_key)
+    if not finite(percent) then percent = 50 end
+    if obs.obs_data_get_bool(settings, mode_key) then
+        obs.obs_data_set_double(settings, normal_key, clamp(percent, 0, 500))
+    else
+        percent = clamp(percent, 0, 500)
+        obs.obs_data_set_double(settings, percent_key, percent)
+        obs.obs_data_set_double(settings, normal_key, percent)
+    end
+    layout(props, nil, settings)
+    return true
+end
+layout = function(props, _, settings)
     local random = obs.obs_data_get_int(settings, 'interval_mode') == 1
     obs.obs_property_set_visible(obs.obs_properties_get(props, 'interval'), not random)
     obs.obs_property_set_visible(obs.obs_properties_get(props, 'random_min'), random)
@@ -751,7 +830,13 @@ local function layout(props, _, settings)
             and obs.obs_data_get_int(settings, prefix .. '_direction') == 8)
         obs.obs_property_set_visible(obs.obs_properties_get(props, prefix .. '_softness'), wipe)
         obs.obs_property_set_visible(obs.obs_properties_get(props, prefix .. '_zoom_anchor'), zoom)
-        obs.obs_property_set_visible(obs.obs_properties_get(props, prefix .. '_zoom_percent'), zoom)
+        local high = obs.obs_data_get_bool(settings, prefix .. '_zoom_high_mode')
+        obs.obs_property_set_visible(obs.obs_properties_get(props,
+            prefix .. '_zoom_normal_percent'), zoom and not high)
+        obs.obs_property_set_visible(obs.obs_properties_get(props,
+            prefix .. '_zoom_percent'), zoom and high)
+        obs.obs_property_set_visible(obs.obs_properties_get(props,
+            prefix .. '_zoom_high_mode'), zoom)
     end
     return true
 end
@@ -803,15 +888,23 @@ info.get_properties = function(d)
                 {'↙ 左下', 6}, {'← 左', 3}, {'↖ 左上', 0}}) do
             obs.obs_property_list_add_int(zoom_anchor_property, anchor[1], anchor[2])
         end
+        local zoom_normal = obs.obs_properties_add_float_slider(group,
+            entry[1] .. '_zoom_normal_percent', '倍率', 0, 500, 0.1)
+        obs.obs_property_float_set_suffix(zoom_normal, ' %')
+        obs.obs_property_set_modified_callback(zoom_normal, zoom_normal_changed)
         local zoom_percent = obs.obs_properties_add_float(group, entry[1] .. '_zoom_percent',
-            '倍率', 0, ZOOM_UI_MAX, 0.1)
+            '倍率', 0, ZOOM_UI_MAX, 10.0)
         obs.obs_property_float_set_suffix(zoom_percent, ' %')
+        local zoom_mode = obs.obs_properties_add_bool(group, entry[1] .. '_zoom_high_mode',
+            '500%を超える倍率を設定')
+        obs.obs_property_set_modified_callback(zoom_mode, zoom_mode_changed)
         obs.obs_properties_add_group(props, entry[1], entry[2], obs.OBS_GROUP_NORMAL, group)
     end
     local message = d and d.notice or ''
     if media then message = message .. (message ~= '' and '\n' or '') ..
         'Media Source: 繰り返し・アクティブ化時の再スタート・非アクティブ時のファイル閉鎖をOFFにしてください。' end
-    message = message .. '\n非表示中は対象ソースをミュートします。同じソースの全参照先に作用します。'
+    message = message .. '\n非表示中は対象ソースをミュートします。同じソースの全参照先に作用します。' ..
+        '\nZoomは開発者環境で5,000%まで動作確認済みです。より高い倍率も設定できますが、環境やソースによっては正常に描画できない場合があります。'
     obs.obs_properties_add_text(props, 'requirements', message, obs.OBS_TEXT_INFO)
     if d then
         local s = obs.obs_source_get_settings(d.context)
@@ -842,7 +935,7 @@ local function frontend_event(event)
     elseif event == obs.OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGED then exiting = false end
 end
 function script_description()
-    return 'ソース定期表示（Ambient Source Events）0.5.0\n' ..
+    return 'ソース定期表示（Ambient Source Events）0.7.0\n' ..
         '各ソースの「フィルタ → ＋ → ソース定期表示」から追加してください。\n' ..
         '映像の定期表示・フェード・Peek・Wipe・Zoomと非表示中の消音。対応条件はREADME-ja.mdをご確認ください。'
 end
