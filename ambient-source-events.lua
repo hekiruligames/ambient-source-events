@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: GPL-2.0-or-later
 -- Ambient Source Events 0.7.0 / OBS Studio 32.0.4
 -- Source timing belongs to video_tick; video_render never advances time.
 local obs = obslua

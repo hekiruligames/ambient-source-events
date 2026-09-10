@@ -167,3 +167,8 @@ Slide、Pop、Rotate、Pulse、Softness以外のFeather形状、Gaussian Blur、
 時間計算の合格は、実際のGPU描画や音声の合格とは区別します。再現可能な試験範囲と未確認事項を受入試験記録へ残します。
 
 統合試験では個別検査後にソースを解放し、残存ソース0件とLua終了処理の成功を確認してからOBSライブラリを終了します。個別検査の`test-result.txt`だけでは合格になりません。`process-result.txt`の成功記録とプロセス終了コード0の両方が必要です。終了前提の失敗による終了コード2は不合格です。
+
+## ライセンス
+
+このソフトウェアは GNU General Public License v2.0 or later（GPL-2.0-or-later）の下で公開しています。
+詳細は [LICENSE](LICENSE) をご確認ください。
