@@ -21,14 +21,31 @@ OBS Studio用Luaスクリプト「ソース定期表示」です。
 - 完全非表示中の対象ソースをミュート
 - フィルター無効化・削除時に表示・音声・再生状態を復元
 
+## ダウンロード
+
+初めて使う場合は、GitHub Releasesから最新版をダウンロードしてください。
+
+▶ [最新版をダウンロード](https://github.com/hekiruligames/ambient-source-events/releases/latest)
+
+ダウンロードしたZIPファイルを展開し、
+`ambient-source-events.lua` をOBS Studioから読み込んで使用します。
+
 ## 導入方法
 
-1. [ambient-source-events.lua](ambient-source-events.lua)を入手し、移動せず使える場所へ置きます。
+1. ダウンロードした`ambient-source-events.lua`を、任意の場所に保存します。
 2. OBS Studioの「ツール」→「スクリプト」を開きます。
 3. 「＋」から`ambient-source-events.lua`を追加します。
+
+   ![OBSのスクリプト画面にambient-source-events.luaを追加した状態](docs/images/ASE-010.png)
+
 4. 自動表示したいソースの「フィルタ」を開きます。
 5. 映像のエフェクトフィルタの「＋」から「ソース定期表示」を追加します。
+
+   ![OBSの映像エフェクトフィルタからソース定期表示を追加する画面](docs/images/ASE-020.png)
+
 6. 間隔、表示時間、開始／終了エフェクトを設定します。
+
+   ![ソース定期表示の間隔と開始・終了エフェクトの設定画面](docs/images/ASE-021.png)
 
 追加のOBSプラグインや外部シェーダーファイルは必要ありません。
 
@@ -64,6 +81,8 @@ OBS Studio用Luaスクリプト「ソース定期表示」です。
 - 「繰り返し」
 - 「ソースがアクティブになったときに再生を再開する」
 - 「非アクティブ時にファイルを閉じる」
+
+![Media Sourceの繰り返し・再生再開・非アクティブ時にファイルを閉じる設定をOFFにした画面](docs/images/ASE-030.png)
 
 条件が一致しない間はイベントを開始せず、ソースを非表示・ミュートにします。本スクリプトの使用中は、ほかの自動再生スクリプト、ホットキー、手動シークなどによる再生操作を併用しないでください。
 
