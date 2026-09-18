@@ -594,7 +594,14 @@ local function update_instance(d, seconds)
             if not d.media then persistent_tick(d, p, remainder) end
         end
     elseif d.media then media_tick(d, p, seconds)
-    else persistent_tick(d, p, seconds) end
+    else
+        persistent_tick(d, p, seconds)
+        -- A zero fixed interval has no waiting frame to render. Start the next
+        -- Persistent event once, but do not advance it again in this tick.
+        if d.state == 'WAITING' and not d.cfg.random and d.cfg.interval <= 1e-9 then
+            start_event(d, p)
+        end
+    end
     local boundary_hidden = (d.state == 'STARTING'
             and (d.cfg.start_effect == PEEK or d.cfg.start_effect == WIPE
                 or (d.cfg.start_effect == ZOOM and d.cfg.start_zoom_scale == 0))
