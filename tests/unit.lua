@@ -174,7 +174,25 @@ local function test()
     destroy(d, p, f)
     d, p, f = make({interval = 0, display_duration = 0.01, start_effect = 0, end_effect = 0}, false, true)
     check(d.alpha == 1 and p.muted, 'Originally muted remains muted when visible')
-    for i = 1, 300 do tick(d, p, 1/60); check(d.alpha == 0 or d.alpha == 1, 'Zero intervals bounded') end
+    for i = 1, 300 do
+        local generation = d.generation
+        tick(d, p, 1/60)
+        check(d.alpha == 0 or d.alpha == 1, 'Zero intervals keep a valid alpha')
+        check(d.generation <= generation + 1, 'Zero intervals restart at most once per tick')
+    end
+    destroy(d, p, f)
+    d, p, f = make({interval = 0, display_duration = 1,
+        start_effect = 4, start_duration = 0.5, start_zoom_percent = 50,
+        end_effect = 4, end_duration = 0.5, end_zoom_percent = 50}, false)
+    local generation = d.generation
+    tick(d, p, 0.5)
+    check(d.state == 'ENDING' and d.end_progress == 0,
+        'Zero-interval Zoom reaches its ending phase')
+    tick(d, p, 0.5)
+    source.video_render(d)
+    check(d.generation == generation + 1 and d.state == 'STARTING'
+            and d.alpha == 1 and not p.muted and near(rendered_scale_x, 0.5),
+        'Zero-interval Zoom starts the next event without a hidden WAITING frame')
     destroy(d, p, f)
     d, p, f = make({display_duration = 2, start_effect = 0, end_effect = 1, end_duration = 0.5}, false)
     check(d.alpha == 1 and d.state == 'VISIBLE', 'No start effect shows immediately')

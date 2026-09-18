@@ -2,12 +2,12 @@
 
 基準: macOS / OBS Studio 32.0.4 / SDR / 1920×1080・60fps。
 
-**初版の受入確認は完了しました。** C製ガード付き独立試験、実OBSでのlive reload、OBSネイティブUI、Browser Source、Capture系ソース、フィルタ有効状態でのOBS本体終了がすべて合格しています。Peek・Wipe・Wipe Softness・Zoom・イージング基本機能、Zoom倍率UI、Media Source非表示境界の1フレーム混入修正も自動試験と実OBS目視確認に合格しました。Zoom倍率UIは通常step 0.1%・高倍率step 10%の最終仕様です。
+**初版の受入確認は完了しました。** C製ガード付き独立試験、実OBSでのlive reload、OBSネイティブUI、Browser Source、Capture系ソース、フィルタ有効状態でのOBS本体終了がすべて合格しています。Peek・Wipe・Wipe Softness・Zoom・イージング基本機能、Zoom倍率UI、Media Source非表示境界の1フレーム混入修正、固定間隔0秒のPersistent Source境界修正も自動試験と実OBS確認に合格しました。Zoom倍率UIは通常step 0.1%・高倍率step 10%の最終仕様です。
 
 | 対象 | 状態 | 証拠・残作業 |
 |---|---|---|
 | Lua登録・設定項目・シェーダー作成 | 個別確認済み | 最新ガード付き統合試験で確認 |
-| 時間計算・状態管理・数値UI | ガード付きPASS | `tests/unit.lua` 6,918項目＋ネイティブ終了。ソース／デコーダーは明示的な模擬環境 |
+| 時間計算・状態管理・数値UI | ガード付きPASS | `tests/unit.lua` 7,222項目＋ネイティブ終了。ソース／デコーダーは明示的な模擬環境 |
 | 実GPU画素と元αの維持 | PASS | 最新の短時間統合試験428項目に含む |
 | イージング基本機能 | 自動試験PASS／実OBS目視PASS | Linear / Cubic Ease In / Ease Out / Ease In-Out、開始終了独立、既定値・旧設定Linear互換、UI表示条件、4エフェクトへの適用と責任分離を自動確認。実OBSでも速度差、独立設定、UI、4エフェクトの正常動作と責任分離、Linear互換を確認 |
 | Peek基本機能 | 自動試験PASS／実OBS目視PASS | 8方向・任意角度・Linear補間・開始終了独立・UI表示条件をunit確認。実GPUで領域外クリップ、移動中の元α、通常位置、出力サイズ不変を確認。実OBS目視項目もすべて合格 |
@@ -15,6 +15,7 @@
 | Wipe Softness | 自動試験PASS／実OBS目視PASS | 0〜100%・1%刻み・既定0%、旧設定0%互換、開始終了独立、ソース高さ基準、滑らかな境界、終端への自然な収束、premultiplied RGB・元α・透明画素・合成色を確認 |
 | Zoom基本機能 | 自動試験PASS／実OBS目視PASS | 0%、100%超、9基準点、Linear補間、開始終了独立、縦横比、透明余白、色・明るさ・元α、元枠外描画、Transform非変更、UI、解放を確認。実OBSでは15,000%まで異常なし |
 | Zoom倍率UI | 自動試験PASS／実OBS目視PASS | 通常step 0.1%、高倍率step 10%。値変更時の非refresh、小数値保持、モード切替、開始終了独立、旧設定互換、実OBSでの正常動作を確認 |
+| 固定間隔0秒のPersistent Source境界 | 自動試験PASS／実OBS録画PASS | 終了後に完全非表示のWAITING描画フレームを挟まず、同一tick内の再開始が最大1回であることを確認。実OBS録画948フレームに完全非表示フレームなし |
 | Media Source非表示境界 | 自動試験PASS／実OBS目視PASS | 開始Zoom／終了なし、開始なし／終了Zoomの各50%・1,000%で、旧再生世代と終了時巻き戻りの連続実GPU出力に可視フレームが混入しないことを確認。実OBSでも複数周期にわたり混入なし |
 | 実Media動画・GIFの反復再生 | PASS | 最新の短時間統合試験428項目に含む |
 | 非アクティブ中の途中停止・再開 | PASS | 最新の短時間統合試験428項目に含む |
@@ -207,6 +208,18 @@
 - 実OBS目視: 開始Zoom／終了なし、開始なし／終了Zoomの両方で、以前の残像・先頭フレーム混入が解消した。複数周期を確認しても完全非表示区間への混入はなく、実OBS上で異常なし。
 
 判定: **Media Source非表示境界の1フレーム混入修正 自動試験PASS／実OBS目視PASS**
+
+## 2026-09-19 固定間隔0秒のPersistent Source境界修正
+
+- 原因: Persistent Sourceのイベント終了時に固定間隔0秒でも一度`WAITING`へ移行し、`alpha=0`の状態が次の`video_tick`まで描画されていた。開始・終了をZoomにした場合、終了Zoomと次の開始Zoomの間に完全非表示フレームとして現れていた。
+- 修正: 固定間隔0秒のPersistent Sourceに限り、イベント終了と同じtick内で次イベントを開始する。次イベントの時間は同じtick内で進めず、再開始は1tickにつき最大1回とした。ランダム間隔、0秒より大きい固定間隔、Media Sourceの処理は変更していない。
+- 回帰テスト: Issueの再現条件（固定間隔0秒、表示時間1秒、開始／終了Zoom各0.5秒、倍率50%）を`tests/unit.lua`へ追加。イベント境界に`WAITING`描画フレームが入らず、次イベントが`STARTING`から始まることと、1tick中の再開始が最大1回であることを確認した。
+- unit: `verification/guarded-runs/20260919-021702-1789751822841168000/`（7,222項目、ネイティブ終了PASS）。v0.7.1表記を含む最終ソースをインストール済みOBS 32.2.2で確認した。テストホストのバージョン判定だけを一時的に許可して実行し、その変更は製品差分へ含めていない。
+- 実GPU統合: サンドボックス内の初回`verification/guarded-runs/20260919-020618-1789751178634130000/`はOpenGLピクセルフォーマット作成失敗で試験開始前に終了した。実GPU環境の`verification/guarded-runs/20260919-020639-1789751199370981000/`は428項目、実音声、残存ソース0、ネイティブ終了までPASSした。
+- 実OBS: OBS 32.2.2でPersistent画像ソースを再現設定にし、修正版Luaを再読み込みして15.829秒・948フレームを録画した。全フレームで可視画素が残り、完全非表示フレームは0件だった。
+- 終了処理: `tests/test_shutdown.py`は3件PASS。`git diff --check`もPASSした。
+
+判定: **固定間隔0秒のPersistent Source境界修正 自動試験PASS／実OBS録画PASS**
 
 ## 終了手順の修正（独立環境で再検証済み）
 

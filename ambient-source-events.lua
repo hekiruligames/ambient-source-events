@@ -1,5 +1,5 @@
 -- SPDX-License-Identifier: GPL-2.0-or-later
--- Ambient Source Events 0.7.0 / OBS Studio 32.0.4
+-- Ambient Source Events 0.7.1 / OBS Studio 32.0.4
 -- Source timing belongs to video_tick; video_render never advances time.
 local obs = obslua
 local bit = require('bit')
@@ -594,7 +594,14 @@ local function update_instance(d, seconds)
             if not d.media then persistent_tick(d, p, remainder) end
         end
     elseif d.media then media_tick(d, p, seconds)
-    else persistent_tick(d, p, seconds) end
+    else
+        persistent_tick(d, p, seconds)
+        -- A zero fixed interval has no waiting frame to render. Start the next
+        -- Persistent event once, but do not advance it again in this tick.
+        if d.state == 'WAITING' and not d.cfg.random and d.cfg.interval <= 1e-9 then
+            start_event(d, p)
+        end
+    end
     local boundary_hidden = (d.state == 'STARTING'
             and (d.cfg.start_effect == PEEK or d.cfg.start_effect == WIPE
                 or (d.cfg.start_effect == ZOOM and d.cfg.start_zoom_scale == 0))
@@ -936,7 +943,7 @@ local function frontend_event(event)
     elseif event == obs.OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGED then exiting = false end
 end
 function script_description()
-    return 'ソース定期表示（Ambient Source Events）0.7.0\n' ..
+    return 'ソース定期表示（Ambient Source Events）0.7.1\n' ..
         '各ソースの「フィルタ → ＋ → ソース定期表示」から追加してください。\n' ..
         '映像の定期表示・フェード・Peek・Wipe・Zoomと非表示中の消音。対応条件はREADME.mdをご確認ください。'
 end

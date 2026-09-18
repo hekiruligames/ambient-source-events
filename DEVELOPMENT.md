@@ -2,13 +2,13 @@
 
 OBS Studioの映像ソースを一定間隔、またはランダムな間隔で表示するLua映像フィルタです。開始・終了にはそれぞれ「なし」「フェード」「Peek」「Wipe」「Zoom」を指定できます。完全非表示中は、そのソースのOBS音声をミュートします。
 
-バージョン: **0.7.0（初版＋Peek・Wipe・Softness・Zoom＋倍率UI＋イージング基本機能）**
+バージョン: **0.7.1（初版＋Peek・Wipe・Softness・Zoom＋倍率UI＋イージング基本機能）**
 基準環境: **macOS / OBS Studio 32.0.4 / SDR**
 実際の検証状況は [受入試験記録](verification/ACCEPTANCE.md) を参照してください。
 
-**初版とPeek・Wipe・Zoom・イージング基本機能、Wipe Softness、Zoom倍率UI、Media Source非表示境界の1フレーム混入修正の受入確認は完了しています。** Zoom倍率UIとMedia Source非表示境界の修正は、自動試験・実OBS目視確認ともに合格しています。
+**初版とPeek・Wipe・Zoom・イージング基本機能、Wipe Softness、Zoom倍率UI、Media Source非表示境界の1フレーム混入修正、固定間隔0秒のPersistent Source境界修正の受入確認は完了しています。** 各修正は自動試験・実OBS確認ともに合格しています。
 
-現行コードの短時間統合試験は428項目、unit試験は6,918項目、初版に対する3分試験は82項目がネイティブ終了まで合格しました。
+現行コードの短時間統合試験は428項目、unit試験は7,222項目、初版に対する3分試験は82項目がネイティブ終了まで合格しました。
 
 live reloadは、実OBSの`obs_script_reload`で再生中・待機中から各1回、計2回を終了まで確認しました。初回待機のリセット、元のミュート状態の復元、phase2の11項目も合格しています。OBSネイティブUI、Browser Source、Capture系ソース、フィルタ有効状態でのOBS本体終了も実OBS上で合格しています。
 
